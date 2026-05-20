@@ -1,0 +1,14 @@
+# Copyright 2026 Google LLC.
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# Per-deployment vars for the my-slurm V1 reference cluster.
+# All architecture defaults live in cluster.yaml.
+
+vars:
+  deployment_name: YOUR_DEPLOYMENT_NAME
+  project_id: YOUR_PROJECT_ID
+  region: us-central1
+  zone: us-central1-b
+  # 1 Spot VM per H200 nodeset = 8 H200 chips per zone, 4 zones = up to 32 chips
+  h200_spot_size: 1

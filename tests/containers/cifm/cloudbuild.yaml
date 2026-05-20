@@ -1,0 +1,43 @@
+# Copyright 2026 Google LLC.
+# SPDX-License-Identifier: Apache-2.0
+
+# Cloud Build pipeline for the CIFM workload container.
+#
+# Pulls the workload source tarball from gs://cifm-staging (canonical artifact
+# location, controlled by us — no GitHub rate-limit dependency, no public-read
+# requirement). Then docker-builds against the local Dockerfile + entrypoint.
+#
+# Submit from the controller (or any machine with gcloud + Cloud Build access):
+#   cd tests/containers/cifm/
+#   gcloud builds submit --config=cloudbuild.yaml .
+#
+# Override the image tag with a substitution:
+#   gcloud builds submit --config=cloudbuild.yaml \
+#     --substitutions=_IMAGE_TAG=us-docker.pkg.dev/$PROJECT_ID/workloads/cifm:v2 .
+
+steps:
+- id: fetch-workload-source-from-gcs
+  name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+  entrypoint: bash
+  args:
+  - -c
+  - gcloud storage cp ${_SOURCE_TARBALL} /workspace/cifm-code.tgz
+
+- id: docker-build
+  name: gcr.io/cloud-builders/docker
+  args: [build, -t, 'us-docker.pkg.dev/$PROJECT_ID/workloads/cifm:${_IMAGE_VERSION}', .]
+
+# Built-in $PROJECT_ID expands in images:; user-defined _IMAGE_VERSION lets the
+# admin bump the version at submit time:
+#   gcloud builds submit --config=cloudbuild.yaml \
+#     --substitutions=_IMAGE_VERSION=v2,_SOURCE_TARBALL=gs://...
+images:
+- 'us-docker.pkg.dev/$PROJECT_ID/workloads/cifm:${_IMAGE_VERSION}'
+
+substitutions:
+  _SOURCE_TARBALL: gs://cifm-staging/code/caltech-ci-fm-gpu-2026-04-22.tar.gz
+  _IMAGE_VERSION: v1
+
+options:
+  machineType: E2_HIGHCPU_8
+  logging: CLOUD_LOGGING_ONLY

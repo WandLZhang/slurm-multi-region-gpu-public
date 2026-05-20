@@ -1,0 +1,49 @@
+# Terraform
+**/.terraform/
+**/.terraform.lock.hcl
+*.tfstate
+*.tfstate.*
+*.tfvars.local
+*.tfplan
+crash.log
+crash.*.log
+
+# Cluster Toolkit deployment outputs (gcluster create writes to ./<deployment_name>/)
+/wz-slurm/
+/wzslurm-img/
+**/*-deployment/
+**/.ghpc/
+
+# Misc local artifacts (transient working notes, not source of truth)
+OVERNIGHT_STATUS.md
+
+# GCP service-account keys, credentials
+*.json
+!**/blueprints/*.json
+!METADATA.json
+.gcp/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# Local data
+tests/data/local/
+**/*.h5ad
+**/*.ckpt
+**/*.pt
+**/*.npy
+**/*.safetensors
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editors
+.vscode/
+.idea/
+*.swp
+vm-watcher.log

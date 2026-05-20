@@ -1,0 +1,771 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Reference deployment of the customer architecture in docs/REFERENCE.md.
+#
+# V3 scope:
+# - Single-VPC architecture (default auto-mode VPC, GLOBAL routing) for primary
+#   networking. RDMA VPC kept as secondary for H200 multi-node training.
+# - Slurm controller in us-central1-b (matches REFERENCE.md Mermaid diagram).
+# - Managed Lustre /home (POSIX, parallel, cross-region capable on same VPC).
+# - 9-nodeset always-on Spot fan-out in `gpu` partition (5 H200 zones across
+#   CONUS + 3 H100 Mega multi-zone + 1 H100 vanilla), ordered by share-of-pool.
+# - In-region us-central1-b H200 nodeset gets RDMA secondary; cross-region
+#   H200 nodesets don't (RDMA VPC profile is per-zone, intra-region only).
+# - Calendar Mode + DWS Flex-Start active-reservation nodesets are added at
+#   the top of `gpu_partition.use` by the admin's daily cron when reservations
+#   fulfill — researchers never trigger DWS submissions from sbatch.
+# - Storage: GCS bucket with HNS at /gcs (writable workspace + /gcs/weights/
+#   subdirectory for read-only inputs); Managed Lustre at /home.
+#
+# Uses the SchedMD pre-built public image (slurm-gcp-6-11-ubuntu-2204-lts-nvidia-570)
+# which has the Lustre client modules pre-installed.
+#
+# === Codified gotchas (so colleagues with the same env can re-deploy) ===
+#
+# 1. CONUS regions for GPU SKUs (verified via `gcloud compute machine-types list`):
+#      a3-ultragpu-8g (H200): us-central1-b, us-west1-c, us-east4-b, us-east5-a, us-south1-b
+#      a3-megagpu-8g  (H100 Mega): us-central1-{a,b,c}, us-west1-{a,b}, us-east4-{a,b,c}, us-east5-a, us-west4-a
+#      a3-highgpu-8g  (H100):      same set as a3-megagpu-8g
+#
+# 2. Cluster Toolkit's blueprint expander (pkg/config/machine_configs.go::extractZone)
+#    looks for `zone:` (singular) on the module FIRST when resolving GPU/CPU
+#    counts from the GCP MachineTypes API. For multi-zone nodesets you MUST
+#    set `zone:` explicitly to a zone offering the SKU; `zones:` (plural) is
+#    for additional zones in the same region.
+#
+# 3. RDMA VPC profile is per-zone (`<zone>-vpc-roce`). The `my-slurm-rdma-net`
+#    module resolves to vars.zone (us-central1-b). H200 nodesets in OTHER
+#    regions can't use it — they go single-node only. Multi-node H200 training
+#    must land in us-central1-b for RoCE to work.
+#
+# 4. Default VPC routing-mode must be GLOBAL (set by scripts/setup-project.sh)
+#    so cross-region clients can reach the Lustre instance + slurmctld in
+#    us-central1.
+#
+# 5. Managed Lustre minimum size 18 TiB; lustre.googleapis.com must be enabled
+#    (and Google-staff project enablement may be required per the module
+#    README — verified working on my-slurm).
+
+---
+blueprint_name: my-slurm
+
+# Skip the machine-type-in-zone validator so cross-region nodesets aren't
+# blocked by the deployment-default zone check.
+validators:
+- validator: test_machine_type_in_zone
+  skip: true
+
+vars:
+  deployment_name: my-slurm
+  project_id: my-slurm
+  region: us-central1
+  zone: us-central1-b
+
+  # Custom slurm-gcp image built with `install_managed_lustre: true` +
+  # `allow_kernel_upgrades: false` — see blueprints/build-lustre-image.yaml.
+  # The Packer build pins the kernel + bakes in matching Lustre client modules
+  # so `mount.lustre` succeeds at runtime. Without this image, the public
+  # `schedmd-slurm-public/slurm-gcp-6-11-ubuntu-2204-lts-nvidia-570` ships
+  # Lustre modules built for kernel 5.15.0-88 but boots 6.8.0-1047, breaking
+  # any `/lustre` mount through slurm-gcp's setup.py.
+  instance_image:
+    project: my-slurm
+    family: wzslurm-img-u22
+
+  # RDMA VPC range (only IP range we manage; default VPC handles primary).
+  rdma_net_range: 192.168.128.0/18
+
+  disk_size_gb: 100
+  base_network_name: $(vars.deployment_name)
+  local_ssd_mountpoint: /mnt/localssd
+
+  h200_spot_size: 1   # 1 VM x 8 H200 = 8 chips per zone
+
+deployment_groups:
+
+# -----------------------------------------------------------------------------
+# cluster-env: per-region default-VPC references, RDMA VPC, Lustre, GCS bucket
+# -----------------------------------------------------------------------------
+- group: cluster-env
+  modules:
+
+  # The project's `default` auto-mode VPC has a subnet in every CONUS region
+  # automatically. We declare one pre-existing-vpc reference per region in use,
+  # so each nodeset gets the correct regional subnet self-link.
+
+  - id: default_vpc_central
+    source: modules/network/pre-existing-vpc
+    settings:
+      network_name: default
+      subnetwork_name: default
+      region: us-central1
+
+  - id: default_vpc_south
+    source: modules/network/pre-existing-vpc
+    settings:
+      network_name: default
+      subnetwork_name: default
+      region: us-south1
+
+  - id: default_vpc_west1
+    source: modules/network/pre-existing-vpc
+    settings:
+      network_name: default
+      subnetwork_name: default
+      region: us-west1
+
+  - id: default_vpc_east4
+    source: modules/network/pre-existing-vpc
+    settings:
+      network_name: default
+      subnetwork_name: default
+      region: us-east4
+
+  - id: default_vpc_east5
+    source: modules/network/pre-existing-vpc
+    settings:
+      network_name: default
+      subnetwork_name: default
+      region: us-east5
+
+  # RDMA secondary network for H200 multi-node training over RoCE. Per-zone
+  # GPU-RDMA VPC profile bound to vars.zone (us-central1-b). Only the
+  # h200_spot_central1b nodeset attaches this — cross-region H200 nodesets
+  # are single-node (RDMA can't span regions).
+  - id: my-slurm-rdma-net
+    source: modules/network/gpu-rdma-vpc
+    settings:
+      network_name: $(vars.base_network_name)-rdma-net
+      network_profile: https://www.googleapis.com/compute/beta/projects/$(vars.project_id)/global/networkProfiles/$(vars.zone)-vpc-roce
+      network_routing_mode: REGIONAL
+      subnetworks_template:
+        name_prefix: $(vars.base_network_name)-mrdma-sub
+        count: 8
+        ip_range: $(vars.rdma_net_range)
+        region: $(vars.region)
+
+  # /home — Filestore Basic_SSD on the default VPC. NFS in-kernel, no kernel
+  # module install needed. Cross-region clients on the same VPC reach it
+  # directly via GLOBAL routing (no transitive peering, no NCC). Per the
+  # official Cluster Toolkit Slurm+Lustre pattern (pfs-managed-lustre-slurm.yaml,
+  # a3ultra-slurm-blueprint.yaml), /home stays on Filestore and Lustre mounts
+  # at /lustre — never at /home.
+  - id: homefs
+    source: modules/file-system/filestore
+    use: [default_vpc_central]
+    settings:
+      filestore_tier: BASIC_SSD
+      size_gb: 2560
+      local_mount: /home
+      deletion_protection:
+        enabled: false
+    outputs:
+    - network_storage
+
+  # /lustre — Managed Lustre, parallel POSIX, for FSDP/ZeRO-style multi-node
+  # checkpoint writes and other parallel I/O patterns. Cross-region clients
+  # on same VPC just work, no NCC needed (Lustre VPC docs:
+  # https://docs.cloud.google.com/managed-lustre/docs/vpc).
+  # Requires the custom slurm-gcp image with install_managed_lustre: true
+  # baked in at Packer build (vars.instance_image points to it). 18 TiB
+  # Standard tier (500 MB/s/TiB).
+  - id: private_service_access
+    source: modules/network/private-service-access
+    use: [default_vpc_central]
+    settings:
+      prefix_length: 22
+
+  - id: managed_lustre_scratch
+    source: modules/file-system/managed-lustre
+    use: [default_vpc_central, private_service_access]
+    settings:
+      name: my-slurm-lustre-scratch
+      local_mount: /lustre
+      remote_mount: lustrefs
+      size_gib: 18000
+      per_unit_storage_throughput: 500
+    outputs:
+    - network_storage
+
+  # GCS bucket with Hierarchical Namespace. Mounted at /gcs cluster-wide:
+  #   /gcs              — writable workspace (sbatch outputs, checkpoints)
+  #   /gcs/weights/     — read-only inputs / model weights (populated during
+  #                       project setup; convention, not enforced by mount)
+  - id: gcs_bucket
+    source: modules/file-system/cloud-storage-bucket
+    settings:
+      enable_hierarchical_namespace: true
+      local_mount: /gcs
+      random_suffix: true
+      mount_options: "implicit_dirs,\
+                      metadata_cache_negative_ttl_secs=0,\
+                      metadata_cache_ttl_secs=-1,\
+                      stat_cache_max_size_mb=-1,\
+                      type_cache_max_size_mb=-1,\
+                      dir_mode=777,\
+                      file_mode=777,\
+                      allow_other"
+
+# -----------------------------------------------------------------------------
+# cluster: controller, login, nodesets, partition
+# -----------------------------------------------------------------------------
+- group: cluster
+  modules:
+  # Minimal startup — drop docker (slurm-gcp public image's bundled docker
+  # install task fails on H200 boot; docker isn't needed for our test path).
+  # Plus: add an /etc/hosts entry for the controller's short hostname so
+  # cross-region compute VMs can resolve `wzslurm-controller` for the
+  # NFS mount of /opt/apps. GCP internal DNS resolves short hostnames only
+  # within the same region; cross-region compute VMs need either FQDN
+  # (which slurm-gcp's setup.py doesn't use) or this /etc/hosts injection.
+  - id: a3_startup
+    source: modules/scripts/startup-script
+    settings:
+      local_ssd_filesystem:
+        mountpoint: $(vars.local_ssd_mountpoint)
+        permissions: "1777"
+      runners:
+      - type: shell
+        destination: add_controller_hosts_entry.sh
+        content: |
+          #!/bin/bash
+          set -e
+          # Resolve wzslurm-controller's CURRENT internal IP via gcloud (the
+          # controller VM gets a different IP across recreates, so a hardcoded
+          # /etc/hosts entry goes stale fast). Cross-region GCP internal DNS
+          # only resolves short hostnames within the same region, hence the
+          # /etc/hosts override on every compute node. Idempotent: re-running
+          # replaces a stale entry with the current one.
+          IP=$(gcloud compute instances describe wzslurm-controller \
+                  --zone=us-central1-b --project=my-slurm \
+                  --format='value(networkInterfaces[0].networkIP)' 2>/dev/null)
+          if [ -z "$IP" ]; then
+            echo "WARN: could not resolve wzslurm-controller IP via gcloud — falling back to GCP DNS" >&2
+            exit 0
+          fi
+          # Remove any prior entry, then append fresh
+          sudo sed -i '/wzslurm-controller$/d' /etc/hosts
+          echo "$IP wzslurm-controller" | sudo tee -a /etc/hosts
+          echo "wzslurm-controller -> $IP added to /etc/hosts"
+
+  # =========================================================================
+  # H200 Spot fan-out — 4 zones across CONUS, ordered by share-of-pool via
+  # node_conf.Weight (lower = higher priority). us-east5-a was dropped: the
+  # zone has no a3-ultragpu-8g chips deployed despite the SKU being listed.
+  # In-region (us-central1-b) gets RDMA secondary; cross-region don't.
+  # =========================================================================
+
+  # H200 Spot — us-south1-b (currently largest free CONUS H200 Spot share).
+  - id: h200_spot_southb
+    source: community/modules/compute/schedmd-slurm-gcp-v6-nodeset
+    use: [default_vpc_south, a3_startup]
+    settings:
+      bandwidth_tier: gvnic_enabled
+      machine_type: a3-ultragpu-8g
+      region: us-south1
+      zone: us-south1-b
+      enable_public_ips: false
+      enable_shielded_vm: true
+      shielded_instance_config:
+        # Secure Boot disabled because the Managed Lustre client kernel module
+        # (lustre-client-modules-6.8.0-1047-gcp from us-apt.pkg.dev) isn't
+        # signed against Ubuntu's Secure Boot Microsoft-cert chain — modprobe
+        # fails with "Key was rejected by service". vTPM + integrity-monitoring
+        # still satisfy compute.requireShieldedVm org policy; image build
+        # provenance + immutable Cloud Audit Logs cover the boot-integrity
+        # gap. Re-enable Secure Boot once we sign the Lustre module with a
+        # MOK key embedded in the Packer build.
+        enable_secure_boot: false
+        enable_vtpm: true
+        enable_integrity_monitoring: true
+      enable_oslogin: true
+      node_count_static: 0
+      node_count_dynamic_max: $(vars.h200_spot_size)
+      enable_placement: false
+      disk_type: hyperdisk-balanced
+      on_host_maintenance: TERMINATE
+      enable_spot_vm: true
+      spot_instance_config:
+        termination_action: STOP
+      advanced_machine_features:
+        threads_per_core: null
+      node_conf:
+        CoresPerSocket: 56
+        SocketsPerBoard: 2
+        ThreadsPerCore: 2
+        Feature: h200,gpu
+        Weight: 1
+
+  # H200 Spot — us-west1-c (cross-region).
+  - id: h200_spot_west1c
+    source: community/modules/compute/schedmd-slurm-gcp-v6-nodeset
+    use: [default_vpc_west1, a3_startup]
+    settings:
+      bandwidth_tier: gvnic_enabled
+      machine_type: a3-ultragpu-8g
+      region: us-west1
+      zone: us-west1-c
+      enable_public_ips: false
+      enable_shielded_vm: true
+      shielded_instance_config:
+        # Secure Boot disabled because the Managed Lustre client kernel module
+        # (lustre-client-modules-6.8.0-1047-gcp from us-apt.pkg.dev) isn't
+        # signed against Ubuntu's Secure Boot Microsoft-cert chain — modprobe
+        # fails with "Key was rejected by service". vTPM + integrity-monitoring
+        # still satisfy compute.requireShieldedVm org policy; image build
+        # provenance + immutable Cloud Audit Logs cover the boot-integrity
+        # gap. Re-enable Secure Boot once we sign the Lustre module with a
+        # MOK key embedded in the Packer build.
+        enable_secure_boot: false
+        enable_vtpm: true
+        enable_integrity_monitoring: true
+      enable_oslogin: true
+      node_count_static: 0
+      node_count_dynamic_max: 1
+      enable_placement: false
+      disk_type: hyperdisk-balanced
+      on_host_maintenance: TERMINATE
+      enable_spot_vm: true
+      spot_instance_config:
+        termination_action: STOP
+      advanced_machine_features:
+        threads_per_core: null
+      node_conf:
+        CoresPerSocket: 56
+        SocketsPerBoard: 2
+        ThreadsPerCore: 2
+        Feature: h200,gpu
+        Weight: 2
+
+  # H200 Spot — us-central1-b (IN-REGION). RDMA secondary disabled here (V4
+  # work): a3-ultragpu-8g requires the first 2 NICs to be GVNIC followed by
+  # 0 or 8 MRDMA NICs. Without a second GVNIC interface (we dropped
+  # `my-slurm-net-1` in V3), bulkInsert rejects the 1-GVNIC + 8-MRDMA layout.
+  # Single-node H200 jobs work fine here without RDMA. Multi-node training
+  # over RoCE will require a second GVNIC subnetwork added back to the
+  # primary network plus the RDMA secondary; track separately.
+  - id: h200_spot_central1b
+    source: community/modules/compute/schedmd-slurm-gcp-v6-nodeset
+    use: [default_vpc_central, a3_startup]
+    settings:
+      bandwidth_tier: gvnic_enabled
+      machine_type: a3-ultragpu-8g
+      region: us-central1
+      zone: us-central1-b
+      enable_public_ips: false
+      enable_shielded_vm: true
+      shielded_instance_config:
+        # Secure Boot disabled because the Managed Lustre client kernel module
+        # (lustre-client-modules-6.8.0-1047-gcp from us-apt.pkg.dev) isn't
+        # signed against Ubuntu's Secure Boot Microsoft-cert chain — modprobe
+        # fails with "Key was rejected by service". vTPM + integrity-monitoring
+        # still satisfy compute.requireShieldedVm org policy; image build
+        # provenance + immutable Cloud Audit Logs cover the boot-integrity
+        # gap. Re-enable Secure Boot once we sign the Lustre module with a
+        # MOK key embedded in the Packer build.
+        enable_secure_boot: false
+        enable_vtpm: true
+        enable_integrity_monitoring: true
+      enable_oslogin: true
+      node_count_static: 0
+      node_count_dynamic_max: 1
+      enable_placement: false
+      disk_type: hyperdisk-balanced
+      on_host_maintenance: TERMINATE
+      enable_spot_vm: true
+      spot_instance_config:
+        termination_action: STOP
+      advanced_machine_features:
+        threads_per_core: null
+      node_conf:
+        CoresPerSocket: 56
+        SocketsPerBoard: 2
+        ThreadsPerCore: 2
+        Feature: h200,gpu
+        Weight: 3
+
+  # H200 Spot — us-east4-b (cross-region).
+  - id: h200_spot_east4b
+    source: community/modules/compute/schedmd-slurm-gcp-v6-nodeset
+    use: [default_vpc_east4, a3_startup]
+    settings:
+      bandwidth_tier: gvnic_enabled
+      machine_type: a3-ultragpu-8g
+      region: us-east4
+      zone: us-east4-b
+      enable_public_ips: false
+      enable_shielded_vm: true
+      shielded_instance_config:
+        # Secure Boot disabled because the Managed Lustre client kernel module
+        # (lustre-client-modules-6.8.0-1047-gcp from us-apt.pkg.dev) isn't
+        # signed against Ubuntu's Secure Boot Microsoft-cert chain — modprobe
+        # fails with "Key was rejected by service". vTPM + integrity-monitoring
+        # still satisfy compute.requireShieldedVm org policy; image build
+        # provenance + immutable Cloud Audit Logs cover the boot-integrity
+        # gap. Re-enable Secure Boot once we sign the Lustre module with a
+        # MOK key embedded in the Packer build.
+        enable_secure_boot: false
+        enable_vtpm: true
+        enable_integrity_monitoring: true
+      enable_oslogin: true
+      node_count_static: 0
+      node_count_dynamic_max: 1
+      enable_placement: false
+      disk_type: hyperdisk-balanced
+      on_host_maintenance: TERMINATE
+      enable_spot_vm: true
+      spot_instance_config:
+        termination_action: STOP
+      advanced_machine_features:
+        threads_per_core: null
+      node_conf:
+        CoresPerSocket: 56
+        SocketsPerBoard: 2
+        ThreadsPerCore: 2
+        Feature: h200,gpu
+        Weight: 4
+
+  # =========================================================================
+  # Degraded-SKU Spot fan-out — H100 Mega (3 multi-zone) → H100 vanilla.
+  # No RDMA secondary on these — they're for workloads that don't need H200's
+  # 141 GiB but still need GPU class.
+  # =========================================================================
+
+  # H100 Mega Spot — us-central1 multi-zone (in-region; largest H100 Mega pool).
+  - id: h100mega_spot_central
+    source: community/modules/compute/schedmd-slurm-gcp-v6-nodeset
+    use: [default_vpc_central, a3_startup]
+    settings:
+      bandwidth_tier: gvnic_enabled
+      machine_type: a3-megagpu-8g
+      region: us-central1
+      zone: us-central1-c   # primary; share-of-pool top
+      zones: [us-central1-a, us-central1-b]
+      enable_public_ips: false
+      enable_shielded_vm: true
+      shielded_instance_config:
+        # Secure Boot disabled because the Managed Lustre client kernel module
+        # (lustre-client-modules-6.8.0-1047-gcp from us-apt.pkg.dev) isn't
+        # signed against Ubuntu's Secure Boot Microsoft-cert chain — modprobe
+        # fails with "Key was rejected by service". vTPM + integrity-monitoring
+        # still satisfy compute.requireShieldedVm org policy; image build
+        # provenance + immutable Cloud Audit Logs cover the boot-integrity
+        # gap. Re-enable Secure Boot once we sign the Lustre module with a
+        # MOK key embedded in the Packer build.
+        enable_secure_boot: false
+        enable_vtpm: true
+        enable_integrity_monitoring: true
+      enable_oslogin: true
+      node_count_static: 0
+      node_count_dynamic_max: 1
+      enable_placement: false
+      disk_type: hyperdisk-balanced
+      on_host_maintenance: TERMINATE
+      enable_spot_vm: true
+      spot_instance_config:
+        termination_action: STOP
+      node_conf:
+        Feature: h100mega,gpu
+        Weight: 5
+
+  # H100 Mega Spot — us-west1 multi-zone.
+  - id: h100mega_spot_west1
+    source: community/modules/compute/schedmd-slurm-gcp-v6-nodeset
+    use: [default_vpc_west1, a3_startup]
+    settings:
+      bandwidth_tier: gvnic_enabled
+      machine_type: a3-megagpu-8g
+      region: us-west1
+      zone: us-west1-a
+      zones: [us-west1-b]
+      enable_public_ips: false
+      enable_shielded_vm: true
+      shielded_instance_config:
+        # Secure Boot disabled because the Managed Lustre client kernel module
+        # (lustre-client-modules-6.8.0-1047-gcp from us-apt.pkg.dev) isn't
+        # signed against Ubuntu's Secure Boot Microsoft-cert chain — modprobe
+        # fails with "Key was rejected by service". vTPM + integrity-monitoring
+        # still satisfy compute.requireShieldedVm org policy; image build
+        # provenance + immutable Cloud Audit Logs cover the boot-integrity
+        # gap. Re-enable Secure Boot once we sign the Lustre module with a
+        # MOK key embedded in the Packer build.
+        enable_secure_boot: false
+        enable_vtpm: true
+        enable_integrity_monitoring: true
+      enable_oslogin: true
+      node_count_static: 0
+      node_count_dynamic_max: 1
+      enable_placement: false
+      disk_type: hyperdisk-balanced
+      on_host_maintenance: TERMINATE
+      enable_spot_vm: true
+      spot_instance_config:
+        termination_action: STOP
+      node_conf:
+        Feature: h100mega,gpu
+        Weight: 6
+
+  # H100 Mega Spot — us-east4 multi-zone.
+  - id: h100mega_spot_east4
+    source: community/modules/compute/schedmd-slurm-gcp-v6-nodeset
+    use: [default_vpc_east4, a3_startup]
+    settings:
+      bandwidth_tier: gvnic_enabled
+      machine_type: a3-megagpu-8g
+      region: us-east4
+      zone: us-east4-a
+      zones: [us-east4-b]   # us-east4-c has zero a3-megagpu-8g chips deployed
+      enable_public_ips: false
+      enable_shielded_vm: true
+      shielded_instance_config:
+        # Secure Boot disabled because the Managed Lustre client kernel module
+        # (lustre-client-modules-6.8.0-1047-gcp from us-apt.pkg.dev) isn't
+        # signed against Ubuntu's Secure Boot Microsoft-cert chain — modprobe
+        # fails with "Key was rejected by service". vTPM + integrity-monitoring
+        # still satisfy compute.requireShieldedVm org policy; image build
+        # provenance + immutable Cloud Audit Logs cover the boot-integrity
+        # gap. Re-enable Secure Boot once we sign the Lustre module with a
+        # MOK key embedded in the Packer build.
+        enable_secure_boot: false
+        enable_vtpm: true
+        enable_integrity_monitoring: true
+      enable_oslogin: true
+      node_count_static: 0
+      node_count_dynamic_max: 1
+      enable_placement: false
+      disk_type: hyperdisk-balanced
+      on_host_maintenance: TERMINATE
+      enable_spot_vm: true
+      spot_instance_config:
+        termination_action: STOP
+      node_conf:
+        Feature: h100mega,gpu
+        Weight: 7
+
+  # H100 vanilla Spot — us-east4 multi-zone (35% of CONUS H100 vanilla pool).
+  - id: h100_spot_east4
+    source: community/modules/compute/schedmd-slurm-gcp-v6-nodeset
+    use: [default_vpc_east4, a3_startup]
+    settings:
+      bandwidth_tier: gvnic_enabled
+      machine_type: a3-highgpu-8g
+      region: us-east4
+      zone: us-east4-a
+      zones: [us-east4-b]
+      enable_public_ips: false
+      enable_shielded_vm: true
+      shielded_instance_config:
+        enable_secure_boot: false
+        enable_vtpm: true
+        enable_integrity_monitoring: true
+      enable_oslogin: true
+      node_count_static: 0
+      node_count_dynamic_max: 1
+      enable_placement: false
+      disk_type: hyperdisk-balanced
+      on_host_maintenance: TERMINATE
+      enable_spot_vm: true
+      spot_instance_config:
+        termination_action: STOP
+      node_conf:
+        Feature: h100,gpu
+        Weight: 8
+
+  # H100 vanilla Spot — us-west1 multi-zone (28% of CONUS H100 vanilla pool).
+  - id: h100_spot_west1
+    source: community/modules/compute/schedmd-slurm-gcp-v6-nodeset
+    use: [default_vpc_west1, a3_startup]
+    settings:
+      bandwidth_tier: gvnic_enabled
+      machine_type: a3-highgpu-8g
+      region: us-west1
+      zone: us-west1-a
+      zones: [us-west1-b]
+      enable_public_ips: false
+      enable_shielded_vm: true
+      shielded_instance_config:
+        enable_secure_boot: false
+        enable_vtpm: true
+        enable_integrity_monitoring: true
+      enable_oslogin: true
+      node_count_static: 0
+      node_count_dynamic_max: 1
+      enable_placement: false
+      disk_type: hyperdisk-balanced
+      on_host_maintenance: TERMINATE
+      enable_spot_vm: true
+      spot_instance_config:
+        termination_action: STOP
+      node_conf:
+        Feature: h100,gpu
+        Weight: 9
+
+  # H100 vanilla Spot — us-east5-a (20% of CONUS H100 vanilla pool).
+  - id: h100_spot_east5
+    source: community/modules/compute/schedmd-slurm-gcp-v6-nodeset
+    use: [default_vpc_east5, a3_startup]
+    settings:
+      bandwidth_tier: gvnic_enabled
+      machine_type: a3-highgpu-8g
+      region: us-east5
+      zone: us-east5-a
+      enable_public_ips: false
+      enable_shielded_vm: true
+      shielded_instance_config:
+        enable_secure_boot: false
+        enable_vtpm: true
+        enable_integrity_monitoring: true
+      enable_oslogin: true
+      node_count_static: 0
+      node_count_dynamic_max: 1
+      enable_placement: false
+      disk_type: hyperdisk-balanced
+      on_host_maintenance: TERMINATE
+      enable_spot_vm: true
+      spot_instance_config:
+        termination_action: STOP
+      node_conf:
+        Feature: h100,gpu
+        Weight: 10
+
+  # H100 vanilla Spot — us-central1 multi-zone (13% of CONUS H100 vanilla pool;
+  # in-region for /home Filestore affinity but lowest H100 vanilla share).
+  - id: h100_spot_central
+    source: community/modules/compute/schedmd-slurm-gcp-v6-nodeset
+    use: [default_vpc_central, a3_startup]
+    settings:
+      bandwidth_tier: gvnic_enabled
+      machine_type: a3-highgpu-8g
+      region: us-central1
+      zone: us-central1-a
+      zones: [us-central1-b, us-central1-c]
+      enable_public_ips: false
+      enable_shielded_vm: true
+      shielded_instance_config:
+        # Secure Boot disabled because the Managed Lustre client kernel module
+        # (lustre-client-modules-6.8.0-1047-gcp from us-apt.pkg.dev) isn't
+        # signed against Ubuntu's Secure Boot Microsoft-cert chain — modprobe
+        # fails with "Key was rejected by service". vTPM + integrity-monitoring
+        # still satisfy compute.requireShieldedVm org policy; image build
+        # provenance + immutable Cloud Audit Logs cover the boot-integrity
+        # gap. Re-enable Secure Boot once we sign the Lustre module with a
+        # MOK key embedded in the Packer build.
+        enable_secure_boot: false
+        enable_vtpm: true
+        enable_integrity_monitoring: true
+      enable_oslogin: true
+      node_count_static: 0
+      node_count_dynamic_max: 1
+      enable_placement: false
+      disk_type: hyperdisk-balanced
+      on_host_maintenance: TERMINATE
+      enable_spot_vm: true
+      spot_instance_config:
+        termination_action: STOP
+      node_conf:
+        Feature: h100,gpu
+        Weight: 11
+
+  # =========================================================================
+  # Single partition `gpu`. Researchers `sbatch -p gpu script.sh`.
+  # Priority: admin-provisioned active reservations (Calendar/Flex) at top
+  # (added by hand as cron fulfills them), then Spot fan-out by share-of-pool.
+  # =========================================================================
+  - id: gpu_partition
+    source: community/modules/compute/schedmd-slurm-gcp-v6-partition
+    use:
+    # ─── (1) Admin-provisioned active reservations — add as cron fulfills ──
+    # When calendar-poll.sh books a Calendar FR named my-cal-XXX, define a new
+    # nodeset block above with `reservation_name: my-cal-XXX` and uncomment its
+    # entry here. Same for Flex (flex-poll.sh) once a window fulfills.
+    # Example:
+    #   - h200_calendar_active_central1b
+    #   - h200_flex_active_southb
+    #
+    # ─── (2) H200 Spot fan-out — Slurm Weight 1-4 (lower = higher prio) ───
+    - h200_spot_southb       # W1 — us-south1-b, 76% of CONUS H200 Spot free pool
+    - h200_spot_west1c       # W2 — us-west1-c, 3% (only other zone with non-zero free today)
+    - h200_spot_central1b    # W3 — us-central1-b, in-region + RDMA-capable
+    - h200_spot_east4b       # W4 — us-east4-b, 0% currently
+    # ─── (3a) H100 Mega Spot — degraded fallback (same 80GB GPU class) ─────
+    - h100mega_spot_central  # W5 — us-central1-{a,b,c}, 60% of CONUS Mega free pool
+    - h100mega_spot_west1    # W6 — us-west1-{a,b}, 27%
+    - h100mega_spot_east4    # W7 — us-east4-{a,b,c}, 6%
+    # ─── (3b) H100 vanilla Spot — final GPU-class resort, ordered by share ─
+    - h100_spot_east4        # W8  — us-east4-{a,b}, 35% of CONUS H100 vanilla pool
+    - h100_spot_west1        # W9  — us-west1-{a,b}, 28%
+    - h100_spot_east5        # W10 — us-east5-a, 20%
+    - h100_spot_central      # W11 — us-central1-{a,b,c}, 13% (in-region but smallest share)
+    settings:
+      exclusive: false
+      partition_name: gpu
+      is_default: true
+      partition_conf:
+        OverSubscribe: EXCLUSIVE
+        ResumeTimeout: 1800   # 30 min — covers a3 first-boot (Lustre kmod, NVIDIA driver,
+                              # slurm-gcp setup.py, GCS-FUSE mount).
+        SuspendTimeout: 1800
+
+  - id: slurm_login
+    source: community/modules/scheduler/schedmd-slurm-gcp-v6-login
+    use: [default_vpc_central]
+    settings:
+      disk_size_gb: 200
+      enable_login_public_ips: false
+      machine_type: n2-standard-4
+      enable_shielded_vm: true
+      shielded_instance_config:
+        # Secure Boot disabled because the Managed Lustre client kernel module
+        # (lustre-client-modules-6.8.0-1047-gcp from us-apt.pkg.dev) isn't
+        # signed against Ubuntu's Secure Boot Microsoft-cert chain — modprobe
+        # fails with "Key was rejected by service". vTPM + integrity-monitoring
+        # still satisfy compute.requireShieldedVm org policy; image build
+        # provenance + immutable Cloud Audit Logs cover the boot-integrity
+        # gap. Re-enable Secure Boot once we sign the Lustre module with a
+        # MOK key embedded in the Packer build.
+        enable_secure_boot: false
+        enable_vtpm: true
+        enable_integrity_monitoring: true
+      enable_oslogin: true
+
+  - id: slurm_controller
+    source: community/modules/scheduler/schedmd-slurm-gcp-v6-controller
+    use:
+    - default_vpc_central
+    - gpu_partition
+    - slurm_login
+    - homefs
+    - managed_lustre_scratch
+    - gcs_bucket
+    settings:
+      enable_controller_public_ips: false
+      disk_type: pd-ssd
+      disk_size_gb: 200
+      machine_type: n2-standard-16
+      enable_external_prolog_epilog: true
+      enable_shielded_vm: true
+      shielded_instance_config:
+        # Secure Boot disabled because the Managed Lustre client kernel module
+        # (lustre-client-modules-6.8.0-1047-gcp from us-apt.pkg.dev) isn't
+        # signed against Ubuntu's Secure Boot Microsoft-cert chain — modprobe
+        # fails with "Key was rejected by service". vTPM + integrity-monitoring
+        # still satisfy compute.requireShieldedVm org policy; image build
+        # provenance + immutable Cloud Audit Logs cover the boot-integrity
+        # gap. Re-enable Secure Boot once we sign the Lustre module with a
+        # MOK key embedded in the Packer build.
+        enable_secure_boot: false
+        enable_vtpm: true
+        enable_integrity_monitoring: true
+      enable_oslogin: true
