@@ -14,11 +14,11 @@
 #
 # Submit conservatively: never more than ONE in-flight request per (sku, zone).
 #
-# Usage (cron):  5 6 * * *  /opt/my-slurm/scripts/flex-poll.sh >> /var/log/flex-poll.log 2>&1
+# Usage (cron):  5 6 * * *  /opt/wz-slurm/scripts/flex-poll.sh >> /var/log/flex-poll.log 2>&1
 
 set -euo pipefail
 
-PROJECT_ID="${PROJECT_ID:-my-slurm}"
+PROJECT_ID="${PROJECT_ID:-$(gcloud config get-value project 2>/dev/null)}"
 FLEX_SUBMIT="${FLEX_SUBMIT:-0}"
 MAX_RUN_SECS="${MAX_RUN_SECS:-604800}"   # 7 days, the Flex-Start max
 
@@ -54,7 +54,7 @@ for target in "${TARGETS[@]}"; do
   echo "ELIGIBLE $sku  $zone  ${vm_count}VMs (no in-flight Flex request)"
 
   if [[ "$FLEX_SUBMIT" == "1" ]]; then
-    RES_NAME="my-flex-$(echo "$sku" | tr -d -)-${zone}-$(date +%s)"
+    RES_NAME="odu-flex-$(echo "$sku" | tr -d -)-${zone}-$(date +%s)"
     gcloud compute reservations create "$RES_NAME" \
       --project="$PROJECT_ID" \
       --zone="$zone" \

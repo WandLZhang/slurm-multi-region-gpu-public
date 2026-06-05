@@ -2,12 +2,12 @@
 # Copyright 2026 Google LLC.
 # SPDX-License-Identifier: Apache-2.0
 
-# Tear down the my-slurm reference deployment cleanly.
+# Tear down the wz-slurm reference deployment cleanly.
 
 set -euo pipefail
 
-PROJECT_ID="${PROJECT_ID:-my-slurm}"
-DEPLOYMENT_NAME="${DEPLOYMENT_NAME:-my-slurm}"
+PROJECT_ID="${PROJECT_ID:-$(gcloud config get-value project 2>/dev/null)}"
+DEPLOYMENT_NAME="${DEPLOYMENT_NAME:-wz-slurm}"
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
 echo "==> gcluster destroy ($DEPLOYMENT_NAME)"

@@ -16,7 +16,7 @@
 
 set -euo pipefail
 
-PROJECT_ID="${PROJECT_ID:-my-slurm}"
+PROJECT_ID="${PROJECT_ID:-$(gcloud config get-value project 2>/dev/null)}"
 ZONE="${ZONE:-us-south1-b}"
 VM_NAME="${VM_NAME:-wz-cifm-h200-spot}"
 SUBNET="${SUBNET:-default}"

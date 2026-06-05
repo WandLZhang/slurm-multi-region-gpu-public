@@ -2,7 +2,7 @@
 # Copyright 2026 Google LLC.
 # SPDX-License-Identifier: Apache-2.0
 
-# End-to-end validation: prove that the my-slurm reference deployment can
+# End-to-end validation: prove that the wz-slurm reference deployment can
 # run a Slurm job on an H200 (Spot or Flex), with the three-layer storage
 # model in place — /home (Filestore, user code), /lustre (Managed Lustre,
 # parallel-POSIX read-only inputs + write-heavy checkpoints), /gcs (GCS-FUSE,
@@ -22,7 +22,7 @@
 set -euo pipefail
 
 echo "============================================================"
-echo " my-slurm end-to-end validation"
+echo " wz-slurm end-to-end validation"
 echo " Job: ${SLURM_JOB_ID}  Node: $(hostname)"
 echo " Zone: $(curl -s -H 'Metadata-Flavor: Google' http://metadata/computeMetadata/v1/instance/zone | awk -F/ '{print $NF}')"
 echo " Date: $(date -u +%FT%TZ)"

@@ -12,11 +12,11 @@
 # opportunity is found. Default off so this script is safe to schedule daily
 # without surprise commitments.
 #
-# Usage (cron):  0 6 * * *  /opt/my-slurm/scripts/calendar-poll.sh >> /var/log/calendar-poll.log 2>&1
+# Usage (cron):  0 6 * * *  /opt/wz-slurm/scripts/calendar-poll.sh >> /var/log/calendar-poll.log 2>&1
 
 set -euo pipefail
 
-PROJECT_ID="${PROJECT_ID:-my-slurm}"
+PROJECT_ID="${PROJECT_ID:-$(gcloud config get-value project 2>/dev/null)}"
 CALENDAR_AUTOBOOK="${CALENDAR_AUTOBOOK:-0}"
 
 # Per-SKU minimum VM count.
@@ -67,7 +67,7 @@ for sku_spec in "${SKUS[@]}"; do
     echo "BOOKABLE  $sku  $ZONE  ${DUR_DAYS}d  $START → $END  ${vm_count}VMs"
 
     if [[ "$CALENDAR_AUTOBOOK" == "1" ]]; then
-      RES_NAME="my-cal-$(echo "$sku" | tr -d -)-$(date +%s)"
+      RES_NAME="odu-cal-$(echo "$sku" | tr -d -)-$(date +%s)"
       gcloud compute future-reservations create "$RES_NAME" \
         --project="$PROJECT_ID" \
         --reservation-mode=CALENDAR \

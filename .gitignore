@@ -8,9 +8,12 @@
 crash.log
 crash.*.log
 
-# Cluster Toolkit deployment outputs (gcluster create writes to ./<deployment_name>/)
+# Cluster Toolkit deployment outputs (gcluster create writes to ./<deployment_name>/).
+# Add new entries here when running with a non-default deployment_name.
 /wz-slurm/
 /wzslurm-img/
+/wz-slurm-runthrough/
+/wzslurmrunthrough-img/
 **/*-deployment/
 **/.ghpc/
 

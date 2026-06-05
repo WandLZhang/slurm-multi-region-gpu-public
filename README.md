@@ -1,227 +1,330 @@
 # Multi-region Slurm reference deployment
 
+> **Slides** — high-level walkthrough deck: [live](https://shiny-broccoli-zgeow24.pages.github.io/slides.html) · [source](slides/slides.md)
 
-A reference Slurm + GPU cluster on Google Cloud that fans Spot capacity across multiple CONUS regions and uses Pyxis/Enroot containers as the workload-delivery primitive. Built for an HPC admin standing up a CUI enclave for scientific GPU researchers.
+A reference Slurm + GPU cluster on Google Cloud that fans Spot capacity across multiple CONUS regions and uses Pyxis/Enroot containers as the workload-delivery primitive. Built for an HPC admin standing up a CUI enclave for ~15 scientific GPU researchers, demonstrated with two example workloads that survive Spot preempts via Slurm `--requeue`:
+
+- **nanoGPT training** (Step 6/7) — checkpoints to **/gcs** (multi-region bucket — the burst-resilient tier)
+- **TinyLlama batch inference** (Step 8) — checkpoints to **/lustre** (Managed Lustre — the parallel-POSIX tier)
 
 ## Architecture at a glance
 
 - **Controller**: us-central1-b, `n2-standard-16`, no public IP (IAP-SSH only)
 - **Login**: us-central1-b, `n2-standard-4`, no public IP
-- **Storage**: Filestore (`/home`) + Managed Lustre 18 TiB (`/lustre`) + GCS bucket with HNS (`/gcs`), all in us-central1, all reachable from every nodeset over the default VPC's GLOBAL routing
-- **Container catalog**: Multi-region US Artifact Registry Docker repo at `us-docker.pkg.dev/$PROJECT/workloads/`, populated by admin `gcloud builds submit` calls; cross-region nodes pull from the nearest mirror
-- **11 Spot nodesets** spread across us-central1, us-south1, us-west1, us-east4, us-east5 — single `gpu` partition, ordered by Slurm `Weight` (W1 = top priority). See `blueprints/cluster.yaml:663-687` for the source of truth.
+- **Storage** — tier matched to workload pattern:
+  - **`/gcs`** — multi-region US bucket (HNS), mounted via Cloud Storage FUSE on every node. **The right tier for multi-region Spot burst workloads** (checkpoint/resume across regions) — the bucket is reachable from every burst region, so when a Spot preempt lands the requeue on a different region the new VM reads the checkpoint from its closest physical replica. Pair with [Rapid Cache](https://docs.cloud.google.com/storage/docs/rapid/rapid-cache) for zonal SSD read caching on hot paths.
+  - **`/lustre`** — Managed Lustre 18 TiB Standard, zonal in us-central1-b. The right tier for **tightly-coupled MPI in-region** (GROMACS, NAMD, AMBER) where the access pattern is concurrent per-rank writes co-located with compute. Not the right choice for multi-region burst.
+  - **`/home`** — Filestore (NFS), us-central1-b. Researcher home dirs.
+- **Container catalog** — Multi-region US Artifact Registry Docker repo at `us-docker.pkg.dev/$PROJECT_ID/workloads/`, populated by admin `gcloud builds submit` calls; cross-region nodes pull from the nearest mirror.
+- **11 Spot nodesets** spread across us-central1, us-south1, us-west1, us-east4, us-east5 — single `gpu` partition, ordered by Slurm `Weight` (W1 = top priority). When a higher-priority nodeset is unavailable (Spot stockout, capacity exhausted), slurmctld auto-ladders to the next-Weight nodeset with zero manual intervention. Source of truth: `gpu_partition.use:` block in [`blueprints/cluster.yaml`](blueprints/cluster.yaml).
 
 ```mermaid
 flowchart TB
-    User["🧑‍🔬 <b>Researcher</b> · sbatch"]
+    User["🧑‍🔬 <b>Researcher</b><br/>sbatch"]
 
-    subgraph Cluster["Single Slurm cluster · default VPC · GLOBAL routing"]
-        direction TB
-        Login["🖥️ <b>Login</b> · us-central1-b"]
-        Ctrl["🎛️ <b>Slurm controller</b> · us-central1-b · slurm-gcp v6.12.1"]
+    subgraph Cluster["Single Slurm cluster · default VPC GLOBAL routing · VmDnsSetting=GlobalOnly"]
+      direction TB
+      Login["🖥️ <b>Login</b> · us-central1-b"]
+      Ctrl["🎛️ <b>slurmctld</b> · us-central1-b · slurm-gcp v6.12.1"]
 
-        subgraph Nodesets["11 Spot nodesets · ordered by Slurm Weight (W1 = highest)"]
-            direction TB
-            SN["<b>us-south1-b</b> · H200 W1 · 76% of CONUS H200 Spot"]
-            WN["<b>us-west1</b> · H200 W2 · H100Mega W6 · H100 W9"]
-            CN["<b>us-central1</b> · H200 W3 (RDMA) · H100Mega W5 · H100 W11"]
-            E4N["<b>us-east4</b> · H200 W4 · H100Mega W7 · H100 W8"]
-            E5N["<b>us-east5-a</b> · H100 W10"]
-        end
-
-        subgraph Storage["Storage tier · us-central1-b"]
-            direction TB
-            FS["💾 <b>/home</b> · Filestore (NFS)"]
-            Lustre["⚡ <b>/lustre</b> · Managed Lustre 18 TiB Standard · parallel POSIX"]
-            GCSm["🪣 <b>/gcs</b> · GCS bucket (HNS) mounted via FUSE"]
-        end
-
-        Login --> Ctrl
-        Ctrl --> Nodesets
-        Nodesets -.cross-region GLOBAL routing.-> Storage
+      subgraph Nodesets["11 Spot nodesets · ordered by Slurm Weight (W1=highest); slurmctld auto-ladders W1→W11 on STOCKOUT"]
+        direction LR
+        SN["us-south1-b<br/><b>H200 W1</b>"]
+        WN["us-west1-c<br/><b>H200 W2</b> · H100Mega W6 · H100 W9"]
+        CN["us-central1-b<br/><b>H200 W3</b> · H100Mega W5 · H100 W11"]
+        E4N["us-east4-b<br/><b>H200 W4</b> · H100Mega W7 · H100 W8"]
+        E5N["us-east5-a<br/>H100 W10"]
+      end
     end
 
-    GAR["📦 <b>Artifact Registry</b> · us-docker.pkg.dev/$PROJECT/workloads · multi-region US"]
+    subgraph BurstStorage["/gcs ✅ burst-resilient tier · checkpoints + sequential writes"]
+      direction LR
+      GCS["🪣 <b>/gcs</b> Multi-region US bucket · HNS-enabled<br/>gcsfuse on every node · physical replicas in multiple US regions<br/>gcsfuse local-buffer/async-flush masks cross-region write latency"]
+    end
 
-    User --> Login
-    Nodesets -.Pyxis + Enroot image pull.-> GAR
+    subgraph ZonalStorage["us-central1-b zonal tier · in-region MPI + atomic-rename heavy + /home"]
+      direction LR
+      Lustre["⚡ <b>/lustre</b><br/>Managed Lustre 18 TiB"]
+      Home["💾 <b>/home</b><br/>Filestore NFS"]
+    end
 
-    style User fill:#fce4ec,stroke:#c62828,stroke-width:2px
-    style Login fill:#e3f2fd,stroke:#1565c0,stroke-width:2px
-    style Ctrl fill:#e3f2fd,stroke:#1565c0,stroke-width:2px
-    style FS fill:#fff3e0,stroke:#e65100,stroke-width:2px
-    style Lustre fill:#fff3e0,stroke:#e65100,stroke-width:2px
-    style GCSm fill:#fff3e0,stroke:#e65100,stroke-width:2px
-    style SN fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px
-    style WN fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px
-    style CN fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px
-    style E4N fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px
-    style E5N fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px
-    style GAR fill:#f3e5f5,stroke:#6a1b9a,stroke-width:2px
+    GAR["📦 <b>Artifact Registry</b> · us-docker.pkg.dev/$PROJECT_ID/workloads<br/>multi-region US · nodes pull from nearest mirror"]
+
+    User --> Login --> Ctrl --> Nodesets
+
+    Nodesets -.Pyxis/Enroot pull.-> GAR
+    Nodesets ==>|"checkpoint writes from ANY burst region"| GCS
+    Nodesets -.MPI scratch · cross-region pays GLOBAL routing.-> Lustre
+    Nodesets -.user home · cross-region pays GLOBAL routing.-> Home
+
+    classDef burst fill:#e6f4ea,stroke:#137333,stroke-width:2px
+    classDef zonal fill:#fef7e0,stroke:#b06000,stroke-width:1px
+    class BurstStorage,GCS burst
+    class ZonalStorage,Lustre,Home zonal
 ```
 
+**Reading the diagram.** Slurmctld picks nodesets by `Weight` (lower wins); the auto-ladder fires unaided when a zone hits Spot `STOCKOUT`. Compute in any of the 5 burst regions writes checkpoints to `/gcs` — the multi-region bucket physically replicates across multiple US regions, and gcsfuse on the compute node returns writes from a local buffer (async-flush in the background), so cross-region write latency is hidden from the workload. `/lustre` and `/home` are zonal in us-central1; reads/writes from a non-central1 compute VM route over the default VPC's GLOBAL BGP and pay full RTT every time.
 
-## Step-by-step deployment
+---
 
-### Step 1 — Local toolchain + GCP project prep (~10 min, admin, idempotent)
+## Which tier should I use for MY job?
+
+Pick by your job's dominant access pattern, **not by the example workloads** in this README. The two examples each pick one tier *to demonstrate that tier works* — they are not recommendations for what your job should pick. Use this table:
+
+| Question about your workload                                                    | If yes → use |
+| :------------------------------------------------------------------------------ | :----------- |
+| It may requeue to a different region after Spot preempt                         | **`/gcs`**   |
+| Writes are sequential appends (stdout, logs, results.jsonl, per-step ckpts)     | **`/gcs`**   |
+| Read-heavy dataset gets reused across regions (cross-region cache benefits it)  | **`/gcs`** + [Rapid Cache](https://docs.cloud.google.com/storage/docs/rapid/rapid-cache) |
+| Writes are atomic-rename heavy (database WAL, etcd, frequent lockfile churn)    | **`/lustre`** |
+| Tightly-coupled MPI with concurrent per-rank writes from many nodes in one region | **`/lustre`** |
+| Read-heavy dataset is hot in one region (cryo-EM particle stacks, training shards) | **`/lustre`** + pre-stage |
+| I genuinely don't know                                                          | **`/gcs`** (cheaper, harder to misuse for burst) |
+
+Measured per-prompt latencies + cost analysis: [`docs/storage_comparison.md`](docs/storage_comparison.md). Headline: `/gcs` wins for cross-region burst (~25% faster end-to-end + ~4 orders of magnitude cheaper at our checkpoint scale); `/lustre` wins for in-region atomic-rename and tightly-coupled MPI patterns.
+
+---
+
+## Prerequisites (one knob: your GCP project)
+
+Everything in this repo reads from your active `gcloud` config — there are no project IDs to edit in any file. **Run these three commands first:**
+
+```bash
+# Point gcloud at the project you want to deploy into
+gcloud config set project YOUR_PROJECT_ID
+
+# Authenticate for Application Default Credentials (needed by Terraform/Packer)
+gcloud auth application-default login
+gcloud auth application-default set-quota-project YOUR_PROJECT_ID
+
+# Used by every gcluster command below
+export PROJECT_ID=$(gcloud config get-value project)
+echo "Targeting project: $PROJECT_ID"
+```
+
+**The project must already exist with billing enabled** — this repo does not create it. If you're starting from a fresh project, also enable the Cloud APIs that you'd need to even check the project:
+
+```bash
+gcloud services enable compute.googleapis.com cloudbilling.googleapis.com --project=$PROJECT_ID
+```
+
+**Local tools.** Linux/macOS workstation with:
+- `gcloud` (Google Cloud SDK)
+- `git`
+- **Terraform 1.12.2 exact** — Cluster Toolkit v1.90.0 requires this exact version. On macOS the script auto-installs via `tfenv`/Homebrew; on Linux, download from [releases.hashicorp.com](https://releases.hashicorp.com/terraform/1.12.2/) and put it on `$PATH`.
+- **Packer ≥ 1.15** — same install pattern as Terraform.
+
+**Clone this repo + initialize the vendored Cluster Toolkit submodule** (a plain `git clone` does **not** pull the submodule):
+
+```bash
+git clone https://github.com/cloud-gtm/slurm-multi-region-gpu.git
+cd slurm-multi-region-gpu
+git submodule update --init
+```
+
+---
+
+## Step 1 — Bootstrap the GCP project (~10 min, idempotent)
 
 ```bash
 ./scripts/setup-project.sh
 ```
 
-What it does against the GCP project:
+This script enables 11 APIs, applies org-policy bypasses, grants IAM, triggers the Lustre service identity, creates the default VPC if absent, sets `VmDnsSetting=GlobalOnly` (critical — without it, cross-region slurmctld→slurmd resolution fails with `getaddrinfo: Name or service not known`), creates a Cloud Router + NAT per region, creates a write-only audit log sink, and prints GPU quotas.
 
-1. Install Terraform + Packer at the versions Cluster Toolkit pins
-2. Enable the GCP APIs the cluster + container build path need
-3. Apply org policies
-4. Grant the default Compute SA the IAM roles the cluster + Cloud Build path need
-5. Create the multi-region US Artifact Registry Docker repo for workload containers
-6. Trigger the Lustre service-account identity
-7. Wire the network for cross-region, no-public-IP cluster traffic — GLOBAL VPC routing, Cloud NAT per nodeset region, IAP-SSH ingress, immutable audit-log sink
-8. Print current GPU quotas in the H200-bearing regions
+**Verify:** the last lines of output show `Done.` and current GPU quotas for us-central1 + us-south1.
 
-This puts the project at the **NIST 800-171 baseline + 6 hardening upgrades** documented in [`docs/nist_800_171_hardening.md`](docs/nist_800_171_hardening.md):
+> **Heads-up on H100/H200 quota.** A fresh project may have **zero** preemptible H100/H200 quota. The cluster will still deploy (and idle nodesets register), but `sbatch` will hang on bulkInsert until quota is granted. Request quota *before* Step 6 if you don't already have it; see [Cloud Console → IAM & Admin → Quotas](https://console.cloud.google.com/iam-admin/quotas) and filter `PREEMPTIBLE_NVIDIA_H200_GPUS`.
 
-| Hardening upgrade                                  | NIST §                       | Where it lives                          |
-| :------------------------------------------------- | :--------------------------- | :-------------------------------------- |
-| Shielded VM (vTPM + integrity-monitoring)          | §3.4.6, §3.14.1              | every `enable_shielded_vm: true` block in `cluster.yaml` |
-| OS Login project-wide (Google identity → Linux user) | §3.5.1, §3.5.2, §3.5.3 (MFA) | `setup-project.sh` step 7 + `enable_oslogin: true` on every VM module |
-| No public IPs on any cluster VM                    | §3.13.1                      | `enable_public_ips: false` on every nodeset/login/controller; SSH via IAP |
-| Cloud NAT in every nodeset region                  | §3.13.1                      | `setup-project.sh` step 7 (5 routers + 5 NATs) |
-| Serial port access disabled                        | §3.4.6, §3.4.7               | org-level `compute.disableSerialPortAccess` |
-| Write-only audit log sink                          | §3.3.8, §3.3.9               | `setup-project.sh` step 7 (400-day retention bucket) |
-| VPC Service Controls perimeter — *deferred*        | §3.1.3, §3.13.1              | org-level, owned by the customer's central security team |
-
-### Step 2 — Build custom Lustre Slurm image (~35 min, admin, one-time per image revision)
+## Step 2 — Build the custom Lustre Slurm image (~35 min, one-time per image revision)
 
 ```bash
-cd cluster-toolkit && make && cd ..
-cluster-toolkit/gcluster create blueprints/build-lustre-image.yaml --out . -w
+cd cluster-toolkit && make && cd ..   # builds the gcluster binary
+
+cluster-toolkit/gcluster create blueprints/build-lustre-image.yaml \
+  --vars project_id=$PROJECT_ID --out . -w
+
 cluster-toolkit/gcluster deploy wzslurm-img --auto-approve
 ```
 
-**Why a custom image** — slurm-gcp's public image ships `lustre-client-modules-5.15.0-88-generic` but boots `6.8.0-1047-gcp`, and Cluster Toolkit's `install-managed-lustre-client.sh` short-circuits when it sees `lustre` in `/proc/filesystems`, so matching kernel modules never get installed → `mount.lustre` fails. The Packer build solves this at image-build time, plus adds the container runtime that the public image lacks.
+This blueprint defines exactly two deployment groups (`image-env` + `image`), so `--auto-approve` builds **only** the Packer image — it does not stand up a cluster. Expect ~5 min for VPC/NAT/firewall + ~30 min for the Packer build (Ansible playbook, CUDA toolkit, NCCL, Pyxis/Enroot, Managed Lustre client kmod).
 
-### Step 3 — Deploy the cluster (~15 min, admin, one-time)
+**Verify the image is READY:**
+```bash
+gcloud compute images list --project=$PROJECT_ID --filter='family:wzslurm-img-u22' \
+  --format='table(name,family,status)'
+# expected: STATUS=READY
+```
+
+## Step 3 — Deploy the cluster (~15 min, one-time)
 
 ```bash
 cluster-toolkit/gcluster create blueprints/cluster.yaml \
-  -d blueprints/cluster-deployment.yaml --out . -w
-cluster-toolkit/gcluster deploy my-slurm --auto-approve
+  -d blueprints/cluster-deployment.yaml --vars project_id=$PROJECT_ID --out . -w
+
+cluster-toolkit/gcluster deploy wz-slurm --auto-approve
 ```
 
 What comes up:
 - Controller (`wzslurm-controller`, us-central1-b)
 - Login (`wzslurm-slurm-login-001`, us-central1-b)
-- Lustre (18 TiB Standard tier, us-central1-b, `lustrefs` filesystem)
-- Filestore (`/nfsshare`, us-central1-b)
-- GCS bucket with Hierarchical Namespace
+- Filestore (`/nfsshare` → `/home`, us-central1-b)
+- Managed Lustre 18 TiB (`/lustrefs` → `/lustre`, us-central1-b)
+- GCS bucket with Hierarchical Namespace (`/gcs`)
 - 11 nodesets registered with Slurm `Weight`, all powered down (`idle~`)
 
-Verify:
+**Verify (give slurmctld ~2 min to come up):**
 ```bash
-gcloud compute ssh wzslurm-slurm-login-001 --zone=us-central1-b --tunnel-through-iap --command='sinfo -N'
-gcloud lustre instances list --location=us-central1-b
-mount | grep -E '/home|/lustre|/gcs'   # on controller, all three mounted
+gcloud compute ssh wzslurm-slurm-login-001 --zone=us-central1-b \
+  --tunnel-through-iap --project=$PROJECT_ID --command='sinfo -N'
+# expected: 11 rows, all STATE=idle~
 ```
 
-### Step 4 — Stage a workload (~10-30 min per workload, admin, one-time per stack version)
+## Step 4 — Build the example nanoGPT workload container (~2 min)
 
-This is the step that makes the researcher's `sbatch` "just work." Two artifacts per workload:
-
-**(a) Container image — code + python deps, pushed to Artifact Registry.** Define a Dockerfile that layers your workload's deps over an ABI-pinned PyTorch base (e.g. `pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime` for PyG-based workloads). Build + push with Cloud Build:
+This builds a self-contained container — public nanoGPT code cloned at build time, tinyshakespeare vendored and tokenized into the image, model trained from scratch. **No private buckets, no logins, no model downloads** — any user in any project can build it.
 
 ```bash
-cd /home/$USER/tests/containers/<workload>/
-gcloud builds submit --config=cloudbuild.yaml .
+cd tests/containers/nanogpt
+gcloud builds submit --config=cloudbuild.yaml --project=$PROJECT_ID .
+cd ../../..
 ```
 
-**(b) Large data inputs — pre-staged to `/lustre/<workload>/`** so every job reads them once cross-region (parallel POSIX bulk read) instead of re-downloading from GCS. Anything > a few GB belongs here; anything < 1 GB can live in the container image instead.
-
-For the **Cellular Interaction Foundation Model from CalTech (CIFM)** 1B reference workload that ships with this repo, the container is at `tests/containers/cifm/` and the SBATCH at `tests/jobs/example.sh`.
-
-### Step 5 — Capacity-allocation cron polls (~5 min, admin, ongoing)
-
-On the controller:
-
-```cron
-0 6 * * *  /opt/my-slurm/scripts/calendar-poll.sh >> /var/log/calendar-poll.log 2>&1
-5 6 * * *  /opt/my-slurm/scripts/flex-poll.sh    >> /var/log/flex-poll.log 2>&1
+**Verify the image landed in your Artifact Registry:**
+```bash
+gcloud artifacts docker images list us-docker.pkg.dev/$PROJECT_ID/workloads \
+  --include-tags --filter='package~nanogpt' --format='table(package,tags,createTime)'
+# expected: nanogpt :v1 with a recent createTime
 ```
 
-`calendar-poll.sh` queries `gcloud compute advice calendar-mode` for 5 SKUs × 5 regions, prints `BOOKABLE` lines per opportunity. `flex-poll.sh` scans 8 (SKU, zone) tuples for DWS Flex-Start eligibility, skips ones with a PROVISIONING reservation already in flight. Both default to dry-run; set `CALENDAR_AUTOBOOK=1` / `FLEX_SUBMIT=1` in cron to upgrade them to actually-book.
+## Step 5 — Copy the test scripts onto the cluster (~30 sec)
 
-When a poll books a Calendar or Flex reservation, the admin defines a new nodeset block in `cluster.yaml` with `reservation_name: my-cal-XXX` and uncomments its entry in `gpu_partition.use:` above the Spot list. Researchers' `sbatch` then automatically lands on the non-preemptible reservation first.
-
-Full 3-task strategy + daily-poll strategy: [`docs/capacity_strategy.md`](docs/capacity_strategy.md).
-
-### Step 6 — Researchers submit jobs (every researcher, every job, seconds)
+The repo isn't yet on the cluster's `/home`. Copy `tests/` to the login VM's `$HOME` (which is the shared Filestore — controller and every compute node will see it):
 
 ```bash
-gcloud compute ssh wzslurm-slurm-login-001 --zone=us-central1-b --tunnel-through-iap
-sbatch /home/$USER/tests/jobs/example.sh
+gcloud compute scp --recurse --tunnel-through-iap --zone=us-central1-b \
+  --project=$PROJECT_ID tests wzslurm-slurm-login-001:~/tests
 ```
 
-The `gpu` partition's `use:` list orders nodesets by Slurm `Weight` (lower = higher priority); see `blueprints/cluster.yaml:663-687` for the live mapping.
-
-Researcher knobs:
-- Default `sbatch script.sh` — Slurm picks the highest-priority nodeset that has free capacity.
-- SKU filter: `sbatch --constraint=h200 script.sh` (or `h100mega`, `h100`).
-- Pin a specific nodeset: `sbatch --nodelist=wzslurm-h200spotsouthb-0 script.sh`.
-- Multi-node H200 RDMA training: `sbatch --constraint=h200,rdma -N 2 script.sh` (only the in-region us-central1-b H200 nodeset has the RDMA secondary attached).
-
-### Step 7 — Test the deployment (admin, once per cluster)
-
-The repo ships one example workload — Caltech's CIFM 1B inference — to exercise the deployment end-to-end.
-
-**Build + push the CIFM container** from the controller:
+## Step 6 — Submit a training job and watch it write checkpoints (~10-15 min)
 
 ```bash
-gcloud compute ssh wzslurm-controller --zone=us-central1-b --tunnel-through-iap
-cd /home/$USER/tests/containers/cifm/
-gcloud builds submit --config=cloudbuild.yaml .
+# Open a session on the login VM
+gcloud compute ssh wzslurm-slurm-login-001 --zone=us-central1-b \
+  --tunnel-through-iap --project=$PROJECT_ID
+
+# (on login VM) submit a long enough run that we'll have time to test preempt
+chmod +x ~/tests/jobs/example.sh
+sbatch --export=ALL,MAX_ITERS=20000 ~/tests/jobs/example.sh
+squeue   # job ID printed by sbatch, status=CF (configuring)
 ```
 
-`cloudbuild.yaml` runs two steps in Cloud Build's managed VM: (1) `gcloud storage cp` the workload tarball from `gs://cifm-staging/code/`, (2) `docker build` against the local Dockerfile + entrypoint, push to `us-docker.pkg.dev/$PROJECT/workloads/cifm:v1`. ~6 GB compressed.
+**What's happening behind the scenes:**
+1. `slurmctld` picks the lowest-Weight idle nodeset (W1 us-south1-b) and calls slurm-gcp's `ResumeProgram`, which makes a `bulkInsert` Compute Engine API call for an a3-ultragpu-8g (8×H200) Spot VM in that zone.
+2. **If the zone has Spot capacity:** the VM is created from the custom image you built in Step 2, slurmd starts, registers with the controller (cross-region resolution works because Step 1 set `VmDnsSetting=GlobalOnly`), and the job goes from `CF` → `R`.
+3. **If the zone is stocked out** (`ZONE_RESOURCE_POOL_EXHAUSTED`): slurmctld marks the nodeset `DOWN` with the GCE error as the reason, and **auto-ladders** to the next-Weight nodeset (W2 us-west1-c) on its next scheduling pass — no manual intervention.
+4. Once the job is running, the entrypoint pulls the nanoGPT container from your Artifact Registry (cached on local SSD after first pull), then `torchrun --nproc_per_node=8 train.py` starts training, checkpointing `ckpt.pt` to `/gcs/checkpoints/$SLURM_JOB_ID/` every `eval_interval` steps.
 
-**Submit the test job** from the login VM:
+**Verify (also on the login VM, ~10 min after `sbatch`):**
 
 ```bash
-gcloud compute ssh wzslurm-slurm-login-001 --zone=us-central1-b --tunnel-through-iap
-sbatch /home/$USER/tests/jobs/example.sh
+# Job should be R; if still CF after 10 min, check `scontrol show node` for stockouts
+squeue
+
+# First ckpt.pt lands on /gcs at iter 50 (~30s of training after the node boots)
+JOB=$(squeue -h -o %i | head -1)
+ls -lh /gcs/checkpoints/$JOB/   # expect ckpt.pt ~120MB
+
+# Training is actually progressing (loss decreasing)
+tail -20 /gcs/runs/nanogpt-${JOB}.out
+# expect lines like: "step 100: train loss 2.39, val loss 2.43" and "saving checkpoint to /gcs/checkpoints/N"
 ```
 
-What `example.sh` does:
-- **First-job-on-cluster lazy-stages** the 11.6 GB model + 45 MB tissue + threshold from `gs://cifm-staging/data/` to `/lustre/cifm/` (idempotent — every subsequent job and every requeue skips it)
-- Authenticates Enroot to Artifact Registry by writing the VM SA's metadata-server access token to `~/.config/enroot/.credentials` (netrc format)
-- `srun --container-image=docker://us-docker.pkg.dev#$PROJECT/workloads/cifm:v1` — Pyxis pulls + caches the image on local SSD on first run; `--container-mounts` bind-mounts `/lustre/cifm/model_checkpoints` over the container's read-only package-relative dir, plus `/tmp` for a writable HOME
-- Runs **STEPS=10000** × ~6.5 min/step on H200 with `--time=UNLIMITED` — open-ended so Spot preempts get exercised naturally over a long horizon; set `STEPS=10` for a one-shot sanity check (~65 min)
-- On preempt, `--requeue` brings the same JobId up on the next-Weight free nodeset; the workload's resume logic reads the highest `checkpoint_step{N}.npy` in `/lustre/checkpoints/$SLURM_JOB_ID/` and picks up at step `N+1`. `SLURM_RESTART_COUNT > 0` confirms the path fired.
+## Step 7 — Simulate a Spot preempt and verify the job resumes (~10 min after preempt)
 
-## Researcher quick reference (the SBATCH contract)
+This is the production-grade test of `--requeue` + ckpt resume. We trigger a real Slurm-aware termination of the running compute VM using the documented [`simulate-maintenance-event`](https://cloud.google.com/compute/docs/instances/simulating-host-maintenance) API. The Spot VM termination signal that arrives is **identical to a real Spot preempt** — slurmd dies, slurmctld detects via heartbeat, the SBATCH `--requeue` directive triggers re-queueing, the next allocation lands on a free nodeset (laddering down if needed), and the entrypoint sees the existing `ckpt.pt` and calls `init_from=resume`.
 
-| Path                                          | Purpose                                                                  |
-| :-------------------------------------------- | :----------------------------------------------------------------------- |
-| `/home/$USER/...`                             | Researcher code + personal env (Filestore NFS, persistent across requeues) |
-| `/lustre/<workload>/...`                      | Admin-staged large data inputs (model weights, datasets)                 |
-| `/lustre/checkpoints/$SLURM_JOB_ID/`          | Researcher writes per-step checkpoints here (parallel POSIX, persists)   |
-| `/gcs/runs/$SLURM_JOB_ID.out`                 | Researcher's stdout (durable archive)                                    |
-| `docker://us-docker.pkg.dev#$PROJECT/workloads/<name>:<tag>` | Container image — reference in `srun --container-image=...`. Enroot's URI syntax uses `#` between hostname and path; without it Pyxis routes to Docker Hub and 401s. |
+**Find the running compute VM:**
+```bash
+# from your workstation, NOT the login VM:
+gcloud compute instances list --project=$PROJECT_ID \
+  --filter='name~^wzslurm-h.*0$' --format='table(name,zone,status)'
+# note the name + zone of the RUNNING H200 VM (the one running your job)
+```
 
-Always include `#SBATCH --requeue`.
+**Trigger the preempt:**
+```bash
+# substitute the VM name + zone from above
+gcloud compute instances simulate-maintenance-event WZ_VM_NAME \
+  --zone=ZONE --project=$PROJECT_ID
+```
 
-## Operational rhythm
+**Then do nothing — Slurm handles the rest.** Wait ~10 min and verify:
 
-| When                         | What                                                                    | Owner       |
-| :--------------------------- | :---------------------------------------------------------------------- | :---------- |
-| 06:00 UTC daily              | `calendar-poll.sh` — grab any > 7-day Calendar window                   | Admin (cron) |
-| 06:05 UTC daily              | `flex-poll.sh` — submit Flex-Start per eligible (SKU, zone) pair        | Admin (cron) |
-| Per researcher submit        | `sbatch -p gpu script.sh` → Slurm picks highest-Weight free nodeset     | Researcher  |
-| Per Spot preemption          | `--requeue` → resume hook on new VM picks up from latest `/lustre` checkpoint | Slurm + workload |
-| Weekly                       | Audit Calendar reservations, cancel ones not consumed by half their window | Admin       |
-| Per stack-version bump       | Edit Dockerfile, `gcloud builds submit --config=cloudbuild.yaml --substitutions=_IMAGE_VERSION=v(N+1) .`, tell researchers | Admin       |
+```bash
+# (on login VM)
+JOB=...   # the same JobID
+squeue    # job should be R again (after going through PD), TIME counter reset, NODELIST may be a different VM/region
+sacct -j $JOB --format=JobID,State,Elapsed,NodeList -X | head
+# expect: job state R; if a different node appears, that's the auto-ladder firing
 
-## Tear down
+# Confirm the resume path fired
+grep -E "RESUME|FRESH|SLURM_RESTART_COUNT" /gcs/runs/nanogpt-${JOB}.out
+# expect: "=== RESUME from /gcs/checkpoints/N/ckpt.pt (SLURM_RESTART_COUNT=1) ==="
+
+# Training continues at the saved iter, not from 0
+tail -10 /gcs/runs/nanogpt-${JOB}.out
+# expect: iter N >> the iter at which the preempt happened, loss continues decreasing
+```
+
+If the job came back on a **different nodeset** than where it started (e.g. W1 → W2), you've validated the full multi-region burst + checkpoint/resume thesis: same JobID, same `/gcs/checkpoints/$JOB/ckpt.pt`, different region — and the workload didn't care.
+
+## Step 8 — Inference workload with Lustre checkpointing (the other tier)
+
+The training job above checkpoints to **/gcs** (multi-region bucket, the right tier for burst). The repo also ships an **inference** workload that checkpoints to **/lustre** to demonstrate the other supported tier — Managed Lustre is zonal in us-central1 but reachable from every burst region over the default VPC's GLOBAL routing, so cross-region requeue can still read the checkpoint.
+
+The inference container at `tests/containers/inference/` runs **TinyLlama-1.1B-Chat** (Apache-2.0, ungated public model) over a vendored list of prompts. Weights are downloaded at build time and baked into the image — runtime has `TRANSFORMERS_OFFLINE=1`, so no network/login is needed for the model. Per-prompt state lands on /lustre:
+
+- `/lustre/inference/$SLURM_JOB_ID/progress.jsonl` — `{"next_index": N}`, atomic write-temp-then-rename after each prompt
+- `/lustre/inference/$SLURM_JOB_ID/results.jsonl` — one JSON line per completed prompt (`{index, prompt, completion, job_id, restart, node}`), fsync'd before progress.jsonl is updated
+
+On preempt + `--requeue`, the new VM (potentially in a different region) reads `progress.jsonl` from /lustre and resumes generation at `next_index` — already-completed prompts are not re-run.
+
+**Build + push the inference container** (one-time per stack version, ~4 min — TinyLlama snapshot adds ~2.2 GB on top of the PyTorch base):
+```bash
+cd tests/containers/inference
+gcloud builds submit --config=cloudbuild.yaml --project=$PROJECT_ID .
+cd ../../..
+```
+
+**Submit** from the login VM (same scp from Step 5; `tests/jobs/inference.sh` is already there):
+```bash
+gcloud compute ssh wzslurm-slurm-login-001 --zone=us-central1-b \
+  --tunnel-through-iap --project=$PROJECT_ID
+chmod +x ~/tests/jobs/inference.sh
+sbatch ~/tests/jobs/inference.sh
+squeue
+```
+
+**Verify the /lustre checkpoint advances** (also on login VM):
+```bash
+JOB=$(squeue -h -o %i -n inference | head -1)
+watch -n 5 "cat /lustre/inference/$JOB/progress.jsonl; wc -l /lustre/inference/$JOB/results.jsonl"
+# expect next_index incrementing as each prompt completes; results.jsonl line count matching next_index
+```
+
+**Force preempt and verify resume from /lustre** — same workstation-side `simulate-maintenance-event` (or `gcloud compute instances delete` for a hard kill that proves the preempt-resume path under the worst case) targeting the running compute VM. After the requeue:
+```bash
+grep -E "RESUME|FRESH" /gcs/runs/inference-${JOB}.out
+# expect: "=== RESUME on wzslurm-... : job=N restart=K prompts=30 resume_from=<N>=N ==="
+# where resume_from is the next_index read from /lustre — strictly > 0 if any prompts had completed before preempt
+```
+
+The point of running both workloads is to show that **the cluster supports both storage strategies**: /gcs for burst-resilient multi-region checkpointing (training, the recommended default), /lustre for the parallel-POSIX tier when your workload wants one shared global filesystem surface (any in-region MPI, or inference where the throughput is sequential per-prompt).
+
+> **Benchmark**: head-to-head measurements of `/gcs` vs `/lustre` for this exact workload (per-prompt write latency, cold-read latency, total wall-clock, cost) on the same H200 nodeset in both us-central1-b (in-region) and us-west1-c (cross-region) live in [`docs/storage_comparison.md`](docs/storage_comparison.md). Headline: `/gcs` wins for cross-region burst (~25% faster end-to-end + ~4 orders of magnitude cheaper at our scale); `/lustre` wins for in-region tightly-coupled MPI patterns.
+
+## Step 9 — Tear down (when done)
 
 ```bash
 ./scripts/destroy.sh
@@ -229,47 +332,97 @@ Always include `#SBATCH --requeue`.
 
 Runs `gcluster destroy` then sweeps stragglers (instances, disks, GCS, Filestore, Lustre, networks).
 
+---
+
+## Operational rhythm (post-deploy)
+
+| When                         | What                                                                    | Owner       |
+| :--------------------------- | :---------------------------------------------------------------------- | :---------- |
+| 06:00 UTC daily              | `calendar-poll.sh` — grab any Calendar-Mode reservation window          | Admin (cron) |
+| 06:05 UTC daily              | `flex-poll.sh` — submit Flex-Start per eligible (SKU, zone) pair        | Admin (cron) |
+| Per researcher submit        | `sbatch -p gpu script.sh` → Slurm picks highest-Weight free nodeset     | Researcher  |
+| Per Spot preemption          | `--requeue` → entrypoint resumes from `/gcs/checkpoints/$JOB/ckpt.pt`   | Slurm + workload |
+| Per stack-version bump       | Edit Dockerfile, `gcloud builds submit --config=cloudbuild.yaml --substitutions=_IMAGE_VERSION=v(N+1) .`, update `IMAGE=` in `example.sh` | Admin       |
+
+Full Calendar/Flex/Spot strategy + per-SKU probability tables: [`docs/capacity_strategy.md`](docs/capacity_strategy.md).
+
+## SBATCH contract (the researcher quick reference)
+
+| Path                                          | Purpose                                                                  |
+| :-------------------------------------------- | :----------------------------------------------------------------------- |
+| `/home/$USER/...`                             | Researcher code + personal env (Filestore NFS, persistent)               |
+| `/gcs/checkpoints/$SLURM_JOB_ID/ckpt.pt`      | **Where the burst-compatible checkpoint lives.** Multi-region — survives requeue to any region. |
+| `/gcs/runs/$SLURM_JOB_ID.out`                 | Researcher's stdout (durable archive)                                    |
+| `/lustre/<workload>/`                         | Pre-staged data for **in-region MPI** workloads only (zonal us-central1) |
+| `docker://us-docker.pkg.dev#$PROJECT_ID/workloads/<name>:<tag>` | Container image — reference in `srun --container-image=...`. Enroot's URI syntax uses `#` between hostname and path; without it Pyxis routes to Docker Hub and 401s. |
+
+Always include `#SBATCH --requeue` so preempted jobs come back automatically.
+
 ## File layout
 
 ```
 .
 ├── README.md                              # this file
 ├── docs/
-│   ├── success_checklist.md               # verified-checks + known blockers + remediation
+│   ├── REFERENCE.md                       # customer-facing architecture
+│   ├── success_checklist.md               # verified-checks list + known blockers + remediation
 │   ├── capacity_strategy.md               # Calendar/Flex/Spot 3-task strategy
-│   └── nist_800_171_hardening.md          # 6 hardening upgrades + § mapping
+│   └── nist_800_171_hardening.md          # NIST § mapping
 ├── cluster-toolkit/                       # vendored Google Cluster Toolkit (git submodule)
 ├── blueprints/
-│   ├── build-lustre-image.yaml            # Packer image build (Lustre + CUDA + NCCL + Pyxis/Enroot)
+│   ├── build-lustre-image.yaml            # Packer image build (image-env + image groups only)
 │   ├── cluster.yaml                       # Slurm + storage + 11 nodesets + Weights
 │   └── cluster-deployment.yaml            # per-deployment vars
 ├── scripts/
-│   ├── setup-project.sh                   # one-time GCP project + local toolchain prep + Artifact Registry repo
+│   ├── setup-project.sh                   # one-time GCP project bootstrap (defaults PROJECT_ID to active gcloud project)
 │   ├── calendar-poll.sh                   # daily Calendar Mode poll (cron)
 │   ├── flex-poll.sh                       # daily Flex-Start poll (cron)
 │   └── destroy.sh                         # gcluster destroy + manual sweep
 └── tests/
     ├── containers/
-    │   └── cifm/
-    │       ├── Dockerfile                 # CIFM container: pytorch base + scanpy + PyG + workload code
-    │       ├── entrypoint.sh              # bridges /lustre/cifm/* to gpu_run.py's expected paths
-    │       └── cloudbuild.yaml            # Cloud Build pipeline: gcs cp → docker build → Artifact Registry push
+    │   ├── nanogpt/                       # TRAINING workload — checkpoints to /gcs
+    │   │   ├── Dockerfile                 # pytorch base + cloned nanoGPT + tokenized tinyshakespeare baked in
+    │   │   ├── entrypoint.sh              # torchrun DDP; resume from /gcs ckpt.pt on requeue
+    │   │   ├── cloudbuild.yaml            # single docker build → Artifact Registry push (no external fetch)
+    │   │   └── input.txt                  # vendored tinyshakespeare (public domain)
+    │   └── inference/                     # INFERENCE workload — checkpoints to /lustre
+    │       ├── Dockerfile                 # pytorch base + TinyLlama-1.1B-Chat weights baked at build (no runtime download)
+    │       ├── inference.py               # batch generation with progress.jsonl + results.jsonl on /lustre
+    │       ├── entrypoint.sh              # resume-aware launcher (TRANSFORMERS_OFFLINE=1 — no network at runtime)
+    │       ├── cloudbuild.yaml            # single docker build → Artifact Registry push
+    │       └── prompts.jsonl              # vendored prompt set (30 instruction-style prompts)
     ├── jobs/
-    │   ├── example.sh                     # canonical reference SBATCH (CIFM 1B, STEPS=10000, no time wall, container + lustre)
-    │   ├── test_h200_e2e.sh               # 30-min H200 + 3-mount smoke test
-    │   ├── test_spot_preemption.sh        # 12h job demonstrating preempt-resume
-    │   └── run_e2e_direct_h200.sh         # non-Slurm fallback (legacy)
+    │   ├── example.sh                     # canonical TRAINING SBATCH (nanoGPT, /gcs checkpoint, --requeue)
+    │   └── inference.sh                   # canonical INFERENCE SBATCH (TinyLlama, /lustre checkpoint, --requeue)
     └── scripts/
+        ├── flex_probability_table.sql     # per-zone 30d-forward Flex chip avg (internal Plx)
+        ├── spot_probability_table.sql     # per-zone 30d-forward Spot chip avg (internal Plx)
         ├── test_h200_inference.py         # H200 detection + matmul helper
         └── test_long_inference.py         # checkpointing loop for preemption test
 ```
 
+## NIST 800-171 hardening (~baseline + 6 upgrades)
+
+| Hardening upgrade                                  | NIST §                       | Where it lives                          |
+| :------------------------------------------------- | :--------------------------- | :-------------------------------------- |
+| Shielded VM (vTPM + integrity-monitoring)          | §3.4.6, §3.14.1              | every `enable_shielded_vm: true` in `cluster.yaml` |
+| OS Login project-wide                              | §3.5.1, §3.5.2, §3.5.3 (MFA) | `setup-project.sh` step 6 + `enable_oslogin: true` on every VM module |
+| No public IPs on any cluster VM                    | §3.13.1                      | `enable_public_ips: false` on every nodeset/login/controller; SSH via IAP |
+| Cloud NAT in every nodeset region                  | §3.13.1                      | `setup-project.sh` step 6 (5 routers + 5 NATs) |
+| Serial port access disabled                        | §3.4.6, §3.4.7               | org-level `compute.disableSerialPortAccess` |
+| Write-only audit log sink                          | §3.3.8, §3.3.9               | `setup-project.sh` step 6 (400-day retention bucket) |
+| VPC Service Controls perimeter — *deferred*        | §3.1.3, §3.13.1              | org-level, owned by the customer's central security team |
+
+Full mapping + rationale: [`docs/nist_800_171_hardening.md`](docs/nist_800_171_hardening.md).
+
 ## References
 
+- [`docs/REFERENCE.md`](docs/REFERENCE.md) — customer-facing architecture rationale
 - [`docs/success_checklist.md`](docs/success_checklist.md) — verified-checks list + known blockers + remediation
-- [`docs/capacity_strategy.md`](docs/capacity_strategy.md) — Calendar / Flex / Spot 3-task daily-poll strategy + daily-poll strategy
-- [`docs/nist_800_171_hardening.md`](docs/nist_800_171_hardening.md) — hardening upgrades with NIST § mapping
+- [`docs/capacity_strategy.md`](docs/capacity_strategy.md) — Calendar / Flex / Spot strategy
+- [`docs/nist_800_171_hardening.md`](docs/nist_800_171_hardening.md) — NIST § mapping
 - [NVIDIA Pyxis](https://github.com/NVIDIA/pyxis) — SLURM SPANK plugin for unprivileged container execution
 - [NVIDIA Enroot](https://github.com/NVIDIA/enroot) — unprivileged container runtime used by Pyxis
-- [`WandLZhang/caltech-ci-fm-gpu`](https://github.com/WandLZhang/caltech-ci-fm-gpu) — example CIFM 1B inference workload
+- [`karpathy/nanoGPT`](https://github.com/karpathy/nanoGPT) — example training workload (MIT)
 - [`GoogleCloudPlatform/cluster-toolkit`](https://github.com/GoogleCloudPlatform/cluster-toolkit)
+- [Cloud Storage multi-region pricing](https://cloud.google.com/storage/pricing) — verify $/GB for your read/write pattern before sizing

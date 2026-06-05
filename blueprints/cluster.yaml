@@ -45,7 +45,7 @@
 #    set `zone:` explicitly to a zone offering the SKU; `zones:` (plural) is
 #    for additional zones in the same region.
 #
-# 3. RDMA VPC profile is per-zone (`<zone>-vpc-roce`). The `my-slurm-rdma-net`
+# 3. RDMA VPC profile is per-zone (`<zone>-vpc-roce`). The `wz-slurm-rdma-net`
 #    module resolves to vars.zone (us-central1-b). H200 nodesets in OTHER
 #    regions can't use it — they go single-node only. Multi-node H200 training
 #    must land in us-central1-b for RoCE to work.
@@ -56,10 +56,10 @@
 #
 # 5. Managed Lustre minimum size 18 TiB; lustre.googleapis.com must be enabled
 #    (and Google-staff project enablement may be required per the module
-#    README — verified working on my-slurm).
+#    README — verified working on wz-slurm).
 
 ---
-blueprint_name: my-slurm
+blueprint_name: wz-slurm
 
 # Skip the machine-type-in-zone validator so cross-region nodesets aren't
 # blocked by the deployment-default zone check.
@@ -68,8 +68,8 @@ validators:
   skip: true
 
 vars:
-  deployment_name: my-slurm
-  project_id: my-slurm
+  deployment_name: wz-slurm
+  project_id: wz-slurm
   region: us-central1
   zone: us-central1-b
 
@@ -81,7 +81,7 @@ vars:
   # Lustre modules built for kernel 5.15.0-88 but boots 6.8.0-1047, breaking
   # any `/lustre` mount through slurm-gcp's setup.py.
   instance_image:
-    project: my-slurm
+    project: $(vars.project_id)
     family: wzslurm-img-u22
 
   # RDMA VPC range (only IP range we manage; default VPC handles primary).
@@ -144,7 +144,7 @@ deployment_groups:
   # GPU-RDMA VPC profile bound to vars.zone (us-central1-b). Only the
   # h200_spot_central1b nodeset attaches this — cross-region H200 nodesets
   # are single-node (RDMA can't span regions).
-  - id: my-slurm-rdma-net
+  - id: wz-slurm-rdma-net
     source: modules/network/gpu-rdma-vpc
     settings:
       network_name: $(vars.base_network_name)-rdma-net
@@ -191,7 +191,7 @@ deployment_groups:
     source: modules/file-system/managed-lustre
     use: [default_vpc_central, private_service_access]
     settings:
-      name: my-slurm-lustre-scratch
+      name: wz-slurm-lustre-scratch
       local_mount: /lustre
       remote_mount: lustrefs
       size_gib: 18000
@@ -206,6 +206,14 @@ deployment_groups:
   - id: gcs_bucket
     source: modules/file-system/cloud-storage-bucket
     settings:
+      # MULTI-REGION + HNS — required for the multi-region burst architecture.
+      # The module's `region` var becomes the bucket's `location`; "US" makes
+      # it multi-region (replicas across Iowa/SC), not zonal. storage_class:
+      # STANDARD pairs with multi-region location. HNS is create-only on the
+      # bucket — if you change either of these on an existing deployment,
+      # terraform must destroy+recreate the bucket (data loss).
+      region: US
+      storage_class: STANDARD
       enable_hierarchical_namespace: true
       local_mount: /gcs
       random_suffix: true
@@ -226,10 +234,11 @@ deployment_groups:
   # Minimal startup — drop docker (slurm-gcp public image's bundled docker
   # install task fails on H200 boot; docker isn't needed for our test path).
   # Plus: add an /etc/hosts entry for the controller's short hostname so
-  # cross-region compute VMs can resolve `wzslurm-controller` for the
-  # NFS mount of /opt/apps. GCP internal DNS resolves short hostnames only
-  # within the same region; cross-region compute VMs need either FQDN
-  # (which slurm-gcp's setup.py doesn't use) or this /etc/hosts injection.
+  # cross-region compute VMs can resolve it for the NFS mount of /opt/apps.
+  # GCP internal DNS resolves short hostnames only within the same region;
+  # cross-region compute VMs need either FQDN (which slurm-gcp's setup.py
+  # doesn't use) or this /etc/hosts injection. The controller hostname is
+  # discovered at runtime — see the add_controller_hosts_entry.sh runner.
   - id: a3_startup
     source: modules/scripts/startup-script
     settings:
@@ -241,24 +250,51 @@ deployment_groups:
         destination: add_controller_hosts_entry.sh
         content: |
           #!/bin/bash
-          set -e
-          # Resolve wzslurm-controller's CURRENT internal IP via gcloud (the
-          # controller VM gets a different IP across recreates, so a hardcoded
-          # /etc/hosts entry goes stale fast). Cross-region GCP internal DNS
-          # only resolves short hostnames within the same region, hence the
-          # /etc/hosts override on every compute node. Idempotent: re-running
-          # replaces a stale entry with the current one.
-          IP=$(gcloud compute instances describe wzslurm-controller \
-                  --zone=us-central1-b --project=my-slurm \
-                  --format='value(networkInterfaces[0].networkIP)' 2>/dev/null)
-          if [ -z "$IP" ]; then
-            echo "WARN: could not resolve wzslurm-controller IP via gcloud — falling back to GCP DNS" >&2
+          # Fallback for cross-region controller resolution. With
+          # VmDnsSetting=GlobalOnly (set by scripts/setup-project.sh) the short
+          # hostname already resolves project-wide, so this is belt-and-suspenders
+          # only — and it MUST NOT be fatal: a gcloud hiccup must never abort the
+          # nodeset startup and block slurmd from registering.
+          #
+          # Everything is derived dynamically — zero hardcoded strings — so this
+          # works for ANY deployment_name in ANY project with no edits:
+          #   * controller hostname → SlurmctldHost in /usr/local/etc/slurm/slurm.conf
+          #                           (slurm-gcp stages this before custom runners fire;
+          #                           short retry loop covers the cold-boot race window)
+          #   * project ID         → GCE metadata server
+          #   * controller zone    → resolved by `gcloud compute instances list`
+          #                           against the cluster-wide name match
+          CTRL=""
+          for _ in 1 2 3 4 5; do
+            CTRL=\$(awk -F= '/^SlurmctldHost/ { sub(/\(.*$/, "", $2); gsub(/[[:space:]]/, "", $2); print $2; exit }' /usr/local/etc/slurm/slurm.conf 2>/dev/null)
+            [ -n "$CTRL" ] && break
+            sleep 2
+          done
+          if [ -z "$CTRL" ]; then
+            echo "WARN: SlurmctldHost not readable from /usr/local/etc/slurm/slurm.conf after 10s — skipping /etc/hosts entry (GlobalOnly DNS still in effect)" >&2
             exit 0
           fi
-          # Remove any prior entry, then append fresh
-          sudo sed -i '/wzslurm-controller$/d' /etc/hosts
-          echo "$IP wzslurm-controller" | sudo tee -a /etc/hosts
-          echo "wzslurm-controller -> $IP added to /etc/hosts"
+          PROJECT=\$(curl -s -H 'Metadata-Flavor: Google' http://metadata.google.internal/computeMetadata/v1/project/project-id)
+          IP=\$(gcloud compute instances list --project="$PROJECT" --filter="name=$CTRL" \
+                  --format='value(networkInterfaces[0].networkIP)' 2>/dev/null | head -1) || true
+          if [ -n "$IP" ]; then
+            # Remove any prior entry for this hostname, then append fresh (idempotent).
+            sudo sed -i "/[[:space:]]${CTRL}\$/d" /etc/hosts
+            echo "$IP $CTRL" | sudo tee -a /etc/hosts
+            echo "$CTRL -> $IP added to /etc/hosts"
+          else
+            echo "WARN: gcloud list returned no IP for $CTRL; relying on VmDnsSetting=GlobalOnly DNS" >&2
+          fi
+          exit 0
+      - type: shell
+        destination: setup_lustre_perms.sh
+        content: |
+          #!/bin/bash
+          # /lustre defaults to root:root mode 755, blocking user-mode mkdir for
+          # workload subdirs (e.g. /lustre/checkpoints/$SLURM_JOB_ID, written by
+          # tests/jobs/example.sh). Make /lustre world-writable with sticky-bit so
+          # per-user dirs work. Idempotent; first node to boot wins, others no-op.
+          chmod 1777 /lustre 2>/dev/null || true
 
   # =========================================================================
   # H200 Spot fan-out — 4 zones across CONUS, ordered by share-of-pool via
@@ -352,7 +388,7 @@ deployment_groups:
   # H200 Spot — us-central1-b (IN-REGION). RDMA secondary disabled here (V4
   # work): a3-ultragpu-8g requires the first 2 NICs to be GVNIC followed by
   # 0 or 8 MRDMA NICs. Without a second GVNIC interface (we dropped
-  # `my-slurm-net-1` in V3), bulkInsert rejects the 1-GVNIC + 8-MRDMA layout.
+  # `wz-slurm-net-1` in V3), bulkInsert rejects the 1-GVNIC + 8-MRDMA layout.
   # Single-node H200 jobs work fine here without RDMA. Multi-node training
   # over RoCE will require a second GVNIC subnetwork added back to the
   # primary network plus the RDMA secondary; track separately.
@@ -687,8 +723,8 @@ deployment_groups:
     source: community/modules/compute/schedmd-slurm-gcp-v6-partition
     use:
     # ─── (1) Admin-provisioned active reservations — add as cron fulfills ──
-    # When calendar-poll.sh books a Calendar FR named my-cal-XXX, define a new
-    # nodeset block above with `reservation_name: my-cal-XXX` and uncomment its
+    # When calendar-poll.sh books a Calendar FR named odu-cal-XXX, define a new
+    # nodeset block above with `reservation_name: odu-cal-XXX` and uncomment its
     # entry here. Same for Flex (flex-poll.sh) once a window fulfills.
     # Example:
     #   - h200_calendar_active_central1b

@@ -1,0 +1,30 @@
+{"prompt": "Explain the difference between SSD and HDD storage in one paragraph."}
+{"prompt": "What is the role of a Slurm scheduler in an HPC cluster?"}
+{"prompt": "Write a haiku about distributed computing."}
+{"prompt": "Summarize the key advantages of GPU acceleration for matrix multiplication."}
+{"prompt": "Explain what Spot VM preemption is and how applications should handle it."}
+{"prompt": "Describe the purpose of checkpointing in long-running training jobs."}
+{"prompt": "What is the difference between Cloud Storage FUSE and a network file system like NFS?"}
+{"prompt": "Write three sentences about the role of Pyxis in a Slurm cluster."}
+{"prompt": "Explain transformer attention in two sentences for a beginner."}
+{"prompt": "List four common reasons a Slurm job stays in CONFIGURING state."}
+{"prompt": "What does Multi-region storage mean in Google Cloud Storage?"}
+{"prompt": "Describe Lustre's parallel file-system design in one paragraph."}
+{"prompt": "What is the difference between training and inference for a language model?"}
+{"prompt": "Write a short poem about a server farm at night."}
+{"prompt": "Explain what bf16 precision is and when to use it."}
+{"prompt": "Describe the role of NCCL in multi-GPU training."}
+{"prompt": "Write three short tips for debugging a stuck Kubernetes pod."}
+{"prompt": "Summarize what Identity-Aware Proxy does in one sentence."}
+{"prompt": "What is a SPANK plugin in Slurm?"}
+{"prompt": "Explain the purpose of the metadata server on a GCE VM."}
+{"prompt": "Describe the difference between a regional and a zonal resource in GCP."}
+{"prompt": "Write a haiku about a tensor."}
+{"prompt": "Why does HuggingFace recommend safetensors over pickle?"}
+{"prompt": "Summarize what 'GLOBAL routing mode' enables in a GCP VPC."}
+{"prompt": "Explain enroot in two sentences."}
+{"prompt": "List three reasons to choose H200 over H100 for LLM inference."}
+{"prompt": "Describe what a maintenance event signals to a GCE VM."}
+{"prompt": "Write three sentences about why containerized workloads simplify HPC operations."}
+{"prompt": "Explain what 'init_from=resume' typically does in a training script."}
+{"prompt": "Summarize the concept of 'time to first token' for LLM inference."}

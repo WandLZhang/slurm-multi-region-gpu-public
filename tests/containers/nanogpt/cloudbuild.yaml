@@ -1,0 +1,22 @@
+# Copyright 2026 Google LLC.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Cloud Build pipeline for the nanoGPT example-workload container.
+# Single step: docker build (nanoGPT cloned + tinyshakespeare tokenized inside
+# the build) → push to the project's OWN Artifact Registry. No external source
+# fetch, no private bucket, no login.
+
+steps:
+- id: docker-build
+  name: gcr.io/cloud-builders/docker
+  args: [build, -t, 'us-docker.pkg.dev/$PROJECT_ID/workloads/nanogpt:${_IMAGE_VERSION}', .]
+
+images:
+- 'us-docker.pkg.dev/$PROJECT_ID/workloads/nanogpt:${_IMAGE_VERSION}'
+
+substitutions:
+  _IMAGE_VERSION: v2
+
+options:
+  machineType: E2_HIGHCPU_8
+  logging: CLOUD_LOGGING_ONLY

@@ -1,0 +1,40 @@
+# Copyright 2026 Google LLC.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Cloud Build pipeline for the TinyLlama inference example-workload container.
+#
+# Single step: docker build (TinyLlama weights downloaded into the image at
+# build time, prompts + inference.py + entrypoint.sh copied in) → push to the
+# project's OWN Artifact Registry. No external runtime fetch, no private
+# bucket, no login.
+#
+# Submit from any machine with gcloud + Cloud Build access:
+#   cd tests/containers/inference/
+#   gcloud builds submit --config=cloudbuild.yaml .
+#
+# Bump the image version at submit time:
+#   gcloud builds submit --config=cloudbuild.yaml \
+#     --substitutions=_IMAGE_VERSION=v2 .
+
+steps:
+- id: docker-build
+  name: gcr.io/cloud-builders/docker
+  args: [build, -t, 'us-docker.pkg.dev/$PROJECT_ID/workloads/inference:${_IMAGE_VERSION}', .]
+
+images:
+- 'us-docker.pkg.dev/$PROJECT_ID/workloads/inference:${_IMAGE_VERSION}'
+
+substitutions:
+  # v2 = instrumented build (per-prompt + load_progress timing → timings.jsonl).
+  # tests/jobs/inference{,_gcs}.sh reference :v2 by default, so the cloudbuild
+  # default must match or fresh users following README Step 4 will hit
+  # image-not-found at sbatch time.
+  _IMAGE_VERSION: v2
+
+options:
+  # Larger machine for the TinyLlama snapshot_download (~2.2 GB) + docker push.
+  # E2_HIGHCPU_8 (8 GB RAM) is tight for AutoModelForCausalLM-style loads, but
+  # snapshot_download is file-copy only so it works.
+  machineType: E2_HIGHCPU_8
+  diskSizeGb: 100
+  logging: CLOUD_LOGGING_ONLY

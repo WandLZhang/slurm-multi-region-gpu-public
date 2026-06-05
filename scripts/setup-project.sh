@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# One-time setup for the my-slurm GCP project + local dev environment.
+# One-time setup for the wz-slurm GCP project + local dev environment.
 # Idempotent — safe to re-run.
 #
 # This codifies every snag encountered while standing up the reference cluster
@@ -30,11 +30,11 @@
 
 set -euo pipefail
 
-PROJECT_ID="${PROJECT_ID:-my-slurm}"
+PROJECT_ID="${PROJECT_ID:-$(gcloud config get-value project 2>/dev/null)}"
 PROJECT_NUMBER=$(gcloud projects describe "$PROJECT_ID" --format='value(projectNumber)')
 DEFAULT_COMPUTE_SA="${PROJECT_NUMBER}-compute@developer.gserviceaccount.com"
-LOG_SINK_NAME="my-slurm-audit-sink"
-LOG_SINK_BUCKET="my-slurm-audit-logs"
+LOG_SINK_NAME="wz-slurm-audit-sink"
+LOG_SINK_BUCKET="wz-slurm-audit-logs"
 NAT_REGIONS=(us-central1 us-south1 us-west1 us-east4 us-east5)
 GAR_REPO="workloads"
 # Multi-region Artifact Registry ("us") for our 5-region Spot fan-out: image pulled from
@@ -119,7 +119,7 @@ echo "==> [4/7] Grant the default Compute Engine SA the roles Cluster Toolkit ne
 # default Compute SA, not the legacy cloudbuild SA, when triggered by gcloud
 # builds submit). Without it, container builds fail at the push step.
 # Compute nodes only need .reader at runtime; the .writer is a Cloud-Build-time
-# privilege carried by the same SA. the customer can tighten by giving Cloud Build a
+# privilege carried by the same SA. ODU can tighten by giving Cloud Build a
 # dedicated SA via --service-account on submit if the threat model requires.
 for role in roles/storage.objectAdmin roles/compute.instanceAdmin.v1 \
             roles/logging.logWriter roles/monitoring.metricWriter \
@@ -167,10 +167,20 @@ gcloud beta services identity create --service=lustre.googleapis.com \
 echo
 echo "==> [6/7] Network: routing-mode GLOBAL, internal firewall, OS Login,"
 echo "          Cloud NAT in every region we deploy nodesets to"
-gcloud compute networks update default --project="$PROJECT_ID" \
-  --bgp-routing-mode=GLOBAL >/dev/null 2>&1 \
-  && echo "    default VPC routing-mode = GLOBAL" \
-  || echo "    (default VPC not present yet — re-run after first deploy)"
+# Projects without auto-mode `default` VPC (created via org-policy
+# compute.skipDefaultNetworkCreation, or with the network manually deleted)
+# fail the GLOBAL routing-mode update + every downstream firewall + NAT step.
+# Create the default VPC up front so the rest of step 6 is unconditional.
+if ! gcloud compute networks describe default --project="$PROJECT_ID" >/dev/null 2>&1; then
+  echo "    default VPC absent — creating auto-mode VPC with GLOBAL routing..."
+  gcloud compute networks create default --project="$PROJECT_ID" \
+    --subnet-mode=auto --bgp-routing-mode=GLOBAL >/dev/null
+  echo "    created default VPC"
+else
+  gcloud compute networks update default --project="$PROJECT_ID" \
+    --bgp-routing-mode=GLOBAL >/dev/null
+  echo "    default VPC routing-mode = GLOBAL"
+fi
 
 if ! gcloud compute firewall-rules describe default-allow-internal \
      --project="$PROJECT_ID" >/dev/null 2>&1; then
@@ -192,7 +202,7 @@ gcloud compute project-info add-metadata --project="$PROJECT_ID" \
 # Project DNS: GlobalOnly so cross-region VMs resolve short hostnames (the
 # slurm-gcp setup uses the controller's short hostname for the /opt/apps NFS
 # mount; cross-region default-DNS scope is per-region only). Trade-off: GCP
-# warns this is less resilient to cross-region DNS outages — for the customer the
+# warns this is less resilient to cross-region DNS outages — for ODU the
 # better-but-heavier option is a Cloud DNS private zone with manual A records.
 gcloud compute project-info add-metadata --project="$PROJECT_ID" \
   --metadata=VmDnsSetting=GlobalOnly >/dev/null 2>&1 \
@@ -293,7 +303,7 @@ echo
 echo "==> Done. Next:"
 echo "    1. cd cluster-toolkit && make             # build the gcluster binary"
 echo "    2. cd .. && cluster-toolkit/gcluster create blueprints/cluster.yaml --out . -w"
-echo "    3.        cluster-toolkit/gcluster deploy my-slurm --auto-approve"
+echo "    3.        cluster-toolkit/gcluster deploy wz-slurm --auto-approve"
 echo
 echo "    For VPC Service Controls (org-level, out of scope for this script):"
 echo "    https://cloud.google.com/vpc-service-controls/docs/create-service-perimeters"
