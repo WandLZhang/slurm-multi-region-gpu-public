@@ -85,6 +85,10 @@ The nodeset list is defined in `blueprints/cluster.yaml`. Each nodeset is assign
 
 Slurm Weight is set per-nodeset via `node_conf.Weight` in `blueprints/cluster.yaml` (lower = higher priority). Assign weights based on your own capacity analysis — prioritize zones with the deepest Spot pools for each SKU.
 
+> **Live weighting (recommended).** Rather than hand-tuning weights from a static capacity view, run [`scripts/spot-obtainability-poll.sh`](../scripts/spot-obtainability-poll.sh) to set them from the **live [Capacity Advisor for Spot API](https://docs.cloud.google.com/sdk/gcloud/reference/alpha/compute/advice/capacity)**. It re-ranks zones **within each SKU tier** by live obtainability (H200 stays above H100 Mega above H100 — the `--constraint` preference is preserved; it never promotes a lower GPU class), then patches `node_conf.Weight` (`APPLY=1`) or, on a running cluster, pushes weights live with `scontrol update nodename=<prefix>-[0-N] weight=<W>` (no redeploy).
+>
+> **Why live obtainability, not a free-capacity snapshot?** A zone can show idle GPUs yet still stock out on a real Spot request. In testing, a zone the API scored **0.9** provisioned in full, while a same-SKU zone it scored **0.1 / 60s** stocked out — even though a raw free-capacity view looked plentiful there. Confirmed on L4 and on real H100 / H200 / B200. The API also ignores quota (a high score ≠ you hold quota) and does not cover TPUs.
+
 **How the researcher uses it**:
 - Default: `sbatch script.sh` — Slurm picks the highest-priority nodeset that has capacity. The script gets whichever GPU class won the allocation.
 - SKU-sensitive (e.g. needs the 141 GiB H200 specifically): `sbatch --constraint=h200 script.sh`. Each H200 nodeset has `Feature=h200,gpu` declared, each H100 Mega has `Feature=h100mega,gpu`, each H100 has `Feature=h100,gpu`, so `--constraint=h200` filters to H200 rows only.
@@ -101,6 +105,7 @@ Slurm Weight is set per-nodeset via `node_conf.Weight` in `blueprints/cluster.ya
 | :---- | :---- | :---- |
 | 06:00 UTC daily | Calendar advice poll → grab any >7-day window | 1 |
 | 06:05 UTC daily | Flex-Start submit (1 per zone, skip if pending) | 2 |
+| 06:10 UTC daily | Spot obtainability poll → re-weight nodesets from the live API (`spot-obtainability-poll.sh`) | 3 |
 | Per researcher submit | `sbatch` → Slurm picks the partition's highest-priority nodeset that has capacity | 3 |
 | Per Spot preemption | `--requeue` → resume hook → next nodeset on the list | 3 |
 | Weekly | Audit Calendar reservations: cancel ones not consumed by half their window | 1 |
