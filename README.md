@@ -85,6 +85,22 @@ Measured per-prompt latencies + cost analysis: [`docs/storage_comparison.md`](do
 
 ---
 
+## Slurm or GKE?
+
+Same problem, two schedulers. Pick by what your users already speak.
+
+| | this repo | [cloud-gtm/gke-multiregion-demo](https://github.com/cloud-gtm/gke-multiregion-demo) |
+|---|---|---|
+| Scheduler | Slurm, `sbatch` | GKE, Kueue + KEDA |
+| Spans regions by | 11 nodesets in one cluster | separate clusters, MultiKueue hub-and-spoke |
+| Overflow trigger | node weight, reranked daily by live obtainability | Pub/Sub backlog and SLA latency |
+| Storage | Managed Lustre + GCS-FUSE | bring your own |
+| Fits | researchers who already write `sbatch`, MPI, POSIX checkpoints | containerized inference with a queue in front |
+
+Their MultiKueue pattern also does deterministic scale-down: pods on the secondary cluster get `pod-deletion-cost: -100` so Kubernetes drains overflow before touching the primary. Slurm has no direct equivalent here.
+
+---
+
 ## Prerequisites (one knob: your GCP project)
 
 Everything in this repo reads from your active `gcloud` config — there are no project IDs to edit in any file. **Run these three commands first:**
