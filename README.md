@@ -1,7 +1,5 @@
 # Multi-region Slurm reference deployment
 
-> **Slides** — high-level walkthrough deck: [live](https://shiny-broccoli-zgeow24.pages.github.io/slides.html) · [source](slides/slides.md)
-
 A reference Slurm + GPU cluster on Google Cloud that fans Spot capacity across multiple CONUS regions and uses Pyxis/Enroot containers as the workload-delivery primitive. Built for an HPC admin standing up a CUI enclave for ~15 scientific GPU researchers, demonstrated with two example workloads that survive Spot preempts via Slurm `--requeue`:
 
 - **nanoGPT training** (Step 6/7) — checkpoints to **/gcs** (multi-region bucket — the burst-resilient tier)
