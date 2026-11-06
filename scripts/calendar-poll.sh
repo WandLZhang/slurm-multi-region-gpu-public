@@ -12,12 +12,22 @@
 # opportunity is found. Default off so this script is safe to schedule daily
 # without surprise commitments.
 #
+# DURATION_MIN and DURATION_MAX set the block lengths to look for. The default,
+# 7d to 30d, finds blocks longer than one 7-day Flex-start run. Calendar blocks
+# can be as short as 1 day, so set DURATION_MIN=1d to see the shorter ones.
+# WINDOW_DAYS sets how far ahead to look for a start (default 60). Over a long
+# window the advice API can skip short blocks, so shorten it along with
+# DURATION_MIN, for example WINDOW_DAYS=21.
+#
 # Usage (cron):  0 6 * * *  /opt/wz-slurm/scripts/calendar-poll.sh >> /var/log/calendar-poll.log 2>&1
 
 set -euo pipefail
 
 PROJECT_ID="${PROJECT_ID:-$(gcloud config get-value project 2>/dev/null)}"
 CALENDAR_AUTOBOOK="${CALENDAR_AUTOBOOK:-0}"
+DURATION_MIN="${DURATION_MIN:-7d}"
+DURATION_MAX="${DURATION_MAX:-30d}"
+WINDOW_DAYS="${WINDOW_DAYS:-60}"
 
 # Per-SKU minimum VM count.
 # a4x-highgpu-4g (GB200 NVL72) is rack-scale: must be a multiple of 16 VMs.
@@ -30,8 +40,10 @@ SKUS=(
   "a4x-highgpu-4g:16"  # GB200 NVL72 — rack-scale (4 GPUs/VM × 16 VMs = 64 chips)
 )
 REGIONS=("us-central1" "us-south1" "us-east4" "us-east5" "us-west1")
-WINDOW_FROM=$(date -u -v+1d +%Y-%m-%d 2>/dev/null || date -u -d '+1 day' +%Y-%m-%d)
-WINDOW_TO=$(date -u -v+60d +%Y-%m-%d 2>/dev/null || date -u -d '+60 day' +%Y-%m-%d)
+# A GPU Calendar request must start at least 87 hours after it's submitted,
+# so search for start times from 88 hours out.
+WINDOW_FROM=$(date -u -v+88H +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d '+88 hours' +%Y-%m-%dT%H:%M:%SZ)
+WINDOW_TO=$(date -u -v+"${WINDOW_DAYS}"d +%Y-%m-%d 2>/dev/null || date -u -d "+${WINDOW_DAYS} day" +%Y-%m-%d)
 
 # Cross-platform epoch parser: GNU date uses -d, BSD/macOS uses -j -f
 to_epoch() {
@@ -39,7 +51,7 @@ to_epoch() {
 }
 
 echo "=== Calendar Mode poll @ $(date -u +%FT%TZ) ==="
-echo "    project=$PROJECT_ID  window=$WINDOW_FROM..$WINDOW_TO  autobook=$CALENDAR_AUTOBOOK"
+echo "    project=$PROJECT_ID  window=$WINDOW_FROM..$WINDOW_TO  duration=$DURATION_MIN..$DURATION_MAX  autobook=$CALENDAR_AUTOBOOK"
 
 for sku_spec in "${SKUS[@]}"; do
   sku="${sku_spec%%:*}"
@@ -50,7 +62,7 @@ for sku_spec in "${SKUS[@]}"; do
       --machine-type="$sku" \
       --vm-count="$vm_count" \
       --region="$region" \
-      --duration-range=min=7d,max=30d \
+      --duration-range="min=$DURATION_MIN,max=$DURATION_MAX" \
       --start-time-range="from=$WINDOW_FROM,to=$WINDOW_TO" \
       --format=json 2>/dev/null) || continue
 
@@ -67,15 +79,23 @@ for sku_spec in "${SKUS[@]}"; do
     echo "BOOKABLE  $sku  $ZONE  ${DUR_DAYS}d  $START → $END  ${vm_count}VMs"
 
     if [[ "$CALENDAR_AUTOBOOK" == "1" ]]; then
-      RES_NAME="odu-cal-$(echo "$sku" | tr -d -)-$(date +%s)"
+      RES_NAME="cal-$(echo "$sku" | tr -d -)-$(date +%s)"
+      # Flags from the Calendar mode docs. future-reservations create counts
+      # VMs with --total-count; --vm-count only exists on the advice command.
       gcloud compute future-reservations create "$RES_NAME" \
         --project="$PROJECT_ID" \
-        --reservation-mode=CALENDAR \
         --zone="$ZONE" \
-        --vm-count="$vm_count" \
         --machine-type="$sku" \
+        --total-count="$vm_count" \
         --start-time="$START" \
-        --end-time="$END" 2>&1 | sed 's/^/    /'
+        --end-time="$END" \
+        --reservation-mode=CALENDAR \
+        --deployment-type=DENSE \
+        --planning-status=SUBMITTED \
+        --require-specific-reservation \
+        --reservation-name="$RES_NAME" \
+        --share-setting=local \
+        --auto-delete-auto-created-reservations 2>&1 | sed 's/^/    /'
     fi
   done
 done

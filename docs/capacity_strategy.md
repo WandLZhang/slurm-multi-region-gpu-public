@@ -17,7 +17,7 @@ for sku in a3-ultragpu-8g a3-megagpu-8g a3-highgpu-8g a4-highgpu-8g; do
     OUT=$(gcloud compute advice calendar-mode \
       --machine-type=$sku --vm-count=2 --region=$region \
       --duration-range=min=7d,max=30d \
-      --start-time-range=from=$(date -u -d '+1 day' +%Y-%m-%d),to=$(date -u -d '+60 day' +%Y-%m-%d) \
+      --start-time-range=from=$(date -u -d '+88 hours' +%Y-%m-%dT%H:%M:%SZ),to=$(date -u -d '+60 day' +%Y-%m-%d) \
       --format=json 2>/dev/null)
     # If recommendation has location set (means BOOKABLE), submit FR
     BOOKABLE=$(echo "$OUT" | jq -r '.[0].recommendations[0].recommendationsPerSpec.spec.location // empty')
@@ -26,13 +26,20 @@ for sku in a3-ultragpu-8g a3-megagpu-8g a3-highgpu-8g a4-highgpu-8g; do
       END=$(echo "$OUT" | jq -r '.[0].recommendations[0].recommendationsPerSpec.spec.endTime')
       ZONE=$(basename "$BOOKABLE")
       echo "GRAB: $sku in $ZONE, $START → $END"
-      gcloud compute future-reservations create my-cal-$(date +%s) \
+      RES_NAME=my-cal-$(date +%s)
+      gcloud compute future-reservations create $RES_NAME \
         --reservation-mode=CALENDAR \
         --zone=$ZONE \
-        --vm-count=2 \
+        --total-count=2 \
         --machine-type=$sku \
         --start-time="$START" \
-        --end-time="$END"
+        --end-time="$END" \
+        --deployment-type=DENSE \
+        --planning-status=SUBMITTED \
+        --require-specific-reservation \
+        --reservation-name=$RES_NAME \
+        --share-setting=local \
+        --auto-delete-auto-created-reservations
     fi
   done
 done
